@@ -12,5 +12,5 @@ Follow the on-screen instructions. Video files will have audio/subs based on the
 Currently not supported, due to me being too lazy to update the files needed for it.
 
 [mpv-webm]: https://github.com/ekisu/mpv-webm
-[build]: https://raw.githubusercontent.com/OliverMD15/mpv-enoder/master/build/encoder.lua
+[build]: https://raw.githubusercontent.com/OliverMD15/mpv-encoder/master/build/encoder.lua
 [mpv]: http://mpv.io
