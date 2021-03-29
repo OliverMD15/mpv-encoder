@@ -1,17 +1,16 @@
-# mpv-webm
-Simple WebM maker for [mpv][mpv], with no external dependencies.
-
+# mpv-encoder
+This is a fork of ekisu's [mpv-webm][mpv-webm] that adds several new settings, while removing unneeded or broken ones.
 ![sample](/img/sample.jpg)
 
 ## Installation
-Place [this][build] in your mpv `scripts` folder. By default, the script is activated by the W (shift+w) key.
+Simply put the [script][build] into your `scripts` folder. By default, the script is activated with the `e` key.
 
 ## Usage
-Follow the on-screen instructions. Encoded WebM files will have audio/subs based on the current playback options (i.e. will be muted if no audio, won't have hardcoded subs if subs aren't visible).
+Follow the on-screen instructions. Video files will have audio/subs based on the current playback options (i.e. will be muted if no audio, won't have hardcoded subs if subs aren't visible).
 
-## Building (development)
-Building requires [`moonc`, the MoonScript compiler][moonscript], added to the PATH, and a GNUMake compatible make. Run `make` on the root directory. The output files will be placed under the `build` directory.
+## Building
+Currently not supported, due to me being too lazy to update the files needed for it.
 
-[build]: https://raw.githubusercontent.com/ElegantMonkey/mpv-webm/master/build/webm.lua
+[mpv-webm]: https://github.com/ekisu/mpv-webm
+[build]: https://raw.githubusercontent.com/OliverMD15/mpv-enoder/master/build/encoder.lua
 [mpv]: http://mpv.io
-[moonscript]: http://moonscript.org
