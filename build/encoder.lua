@@ -12,7 +12,7 @@ local options = {
 	-- backslashes as a path separator. Examples of valid inputs for this field
 	-- would be: [[]] (the default, empty value), [[C:\Users\John]] (on Windows),
 	-- and [[/home/john]] (on Unix-like systems eg. Linux).
-	output_directory = [[]],
+	output_directory = [[~/desktop]],
 	run_detached = false,
 	-- Template string for the output file
 	-- %f/%F - Filename, with or without extension
@@ -27,15 +27,18 @@ local options = {
 	scale_height = -1,
 	-- Change the FPS of the output video, dropping or duplicating frames as needed. -1 means the FPS will be unchanged from the source.
 	fps = -1,
+	GIF = -1,
 	-- Sets the output format, from a few predefined ones. Currently we have webm-vp8 (libvpx/libvorbis), webm-vp9 (libvpx-vp9/libopus), mp4 (x264/libmp3lame), copy (h264_nvenc/libmp3lame), ogg (libopus)
 	output_format = "mp4",
 	apply_current_filters = true,
-	write_filename_on_metadata = true,
+	write_filename_on_metadata = false,
+	tune = "animation",
 	libvpx_threads = 4,
-	crf = 23,
-	audio_bitrate = 128000,
-	-- Displays the encode progress, requires run_detached to be disabled. "auto" will display progress on non-Windows platforms.
-	-- On Windows it shows a cmd popup, but it needs mpv to be listed as PATH to function properly.
+	crf = 26,
+	audio_bitrate = 96000,
+	-- gif dither mode, 0-5 for bayer w/ bayer_scale 0-5, 6 for paletteuse default (sierra2_4a)
+	gif_dither = 3,
+	-- Display the encode progress, in %. Requires run_detached to be disabled. On Windows, it shows a cmd popup. "auto" will display progress on non-Windows platforms.
 	display_progress = "auto",
 	font_size = 22,
 	margin = 10,
@@ -635,6 +638,9 @@ do
         codecs[#codecs + 1] = "--oac=" .. tostring(self.audioCodec)
       end
       return codecs
+    end,
+    postCommandModifier = function(self, command, region, startTime, endTime)
+      return command
     end
   }
   _base_0.__index = _base_0
@@ -682,7 +688,14 @@ do
     end,
     getFlags = function(self)
       return {
-        "--ovcopts-add=threads=" .. tostring(options.libvpx_threads)
+		"--vf-add=format=yuv420p",
+        "--ovcopts-add=threads=" .. tostring(options.libvpx_threads),
+		"--ovcopts-add=deadline=good",
+		"--ovcopts-add=cpu-used=0",
+		"--ovcopts-add=auto-alt-ref=1",
+		"--ovcopts-add=lag-in-frames=25",
+		"--ovcopts-add=crf=" .. tostring(options.crf),
+		"--ovcopts=b=100000000"
       }
     end
   }
@@ -691,9 +704,9 @@ do
   _class_0 = setmetatable({
     __init = function(self)
       self.displayName = "VP8"
-      self.supportsTwopass = false
+      self.supportsTwopass = true
       self.videoCodec = "libvpx"
-      self.audioCodec = "libvorbis"
+      self.audioCodec = ""
       self.outputExtension = "webm"
       self.acceptsBitrate = true
     end,
@@ -732,7 +745,17 @@ do
   local _base_0 = {
     getFlags = function(self)
       return {
-        "--ovcopts-add=threads=" .. tostring(options.libvpx_threads)
+        "--ovcopts-add=threads=" .. tostring(options.libvpx_threads),
+		"--vf-add=format=fmt=yuv420p",
+		"--ovcopts-add=deadline=good",
+		"--ovcopts-add=cpu-used=3",
+		"--ovcopts-add=row-mt=1",
+		"--ovcopts-add=tile-columns=2",
+		"--ovcopts-add=auto-alt-ref=1",
+		"--ovcopts-add=lag-in-frames=25",
+		"--ovcopts-add=g=240",
+		"--ovcopts-add=crf=" .. tostring(options.crf),
+		"--oacopts=b=" .. tostring(options.audio_bitrate)
       }
     end
   }
@@ -741,9 +764,9 @@ do
   _class_0 = setmetatable({
     __init = function(self)
       self.displayName = "VP9"
-      self.supportsTwopass = true
+      self.supportsTwopass = false
       self.videoCodec = "libvpx-vp9"
-      self.audioCodec = "libopus"
+      self.audioCodec = ""
       self.outputExtension = "webm"
       self.acceptsBitrate = true
     end,
@@ -779,7 +802,21 @@ local MP4
 do
   local _class_0
   local _parent_0 = Format
-  local _base_0 = { }
+  local _base_0 = {
+    getFlags = function(self)
+      return {
+		"--vf-add=format=yuv420p",
+		"--ofopts-add=movflags=+faststart",
+		"--ovcopts-add=preset=slow",
+		"--ovcopts-add=profile=high",
+		"--ovcopts-add=level=5.2",
+		"--ovcopts-add=x264opts=opencl",
+		"--ovcopts-add=crf=" .. tostring(options.crf),
+		"--oacopts=b=" .. tostring(options.audio_bitrate),
+		"--ovcopts-add=tune=" .. tostring(options.tune)
+      }
+    end
+  }
   _base_0.__index = _base_0
   setmetatable(_base_0, _parent_0.__base)
   _class_0 = setmetatable({
@@ -787,7 +824,7 @@ do
       self.displayName = "MP4"
       self.supportsTwopass = false
       self.videoCodec = "libx264"
-      self.audioCodec = "aac"
+      self.audioCodec = "libopus"
       self.outputExtension = "mp4"
       self.acceptsBitrate = true
     end,
@@ -819,24 +856,33 @@ do
   MP4 = _class_0
 end
 formats["mp4"] = MP4()
-local MP4NVENC
+local AV1
 do
   local _class_0
   local _parent_0 = Format
-  local _base_0 = { }
+  local _base_0 = {
+    getFlags = function(self)
+      return {
+		"--vf-add=format=yuv420p10le",
+		"--ovcopts-add=preset=10",
+		"--ovcopts-add=crf=" .. tostring(options.crf),
+		"--oacopts=b=" .. tostring(options.audio_bitrate)
+      }
+    end
+  }
   _base_0.__index = _base_0
   setmetatable(_base_0, _parent_0.__base)
   _class_0 = setmetatable({
     __init = function(self)
-      self.displayName = "HQ Copy (NVENC)"
+      self.displayName = "AV1"
       self.supportsTwopass = false
-      self.videoCodec = "h264_nvenc"
-      self.audioCodec = "aac"
-      self.outputExtension = "mp4"
-      self.acceptsBitrate = false
+      self.videoCodec = "libsvtav1"
+      self.audioCodec = "libopus"
+      self.outputExtension = "webm"
+      self.acceptsBitrate = true
     end,
     __base = _base_0,
-    __name = "MP4NVENC",
+    __name = "AV1",
     __parent = _parent_0
   }, {
     __index = function(cls, name)
@@ -860,14 +906,137 @@ do
   if _parent_0.__inherited then
     _parent_0.__inherited(_parent_0, _class_0)
   end
-  MP4NVENC = _class_0
+  AV1 = _class_0
 end
-formats["mp4-nvenc"] = MP4NVENC()
+formats["AV1"] = AV1()
+local MP4COPY
+do
+  local _class_0
+  local _parent_0 = Format
+  local _base_0 = {
+    getFlags = function(self)
+      return {
+		"--vf=format=convert=no",
+		"--vf-remove=scale,fps",
+		"--ovcopts-add=preset=p2",
+		"--ovcopts-add=tune=hq",
+--		"--ovcopts-add=bf=0",
+--		"--ovcopts-add=profile=main10",
+--		"--ovcopts-add=vsync=0",
+--		"--ovcopts-add=level=5.2",
+		"--ovcopts-add=qp=10",
+		"--oacopts=b=320000"
+      }
+    end
+  }
+  _base_0.__index = _base_0
+  setmetatable(_base_0, _parent_0.__base)
+  _class_0 = setmetatable({
+    __init = function(self)
+      self.displayName = "Copy"
+      self.supportsTwopass = false
+	  self.videoCodec = "hevc_nvenc"
+      self.audioCodec = "libfdk_aac"
+      self.outputExtension = "mp4"
+      self.acceptsBitrate = true
+    end,
+    __base = _base_0,
+    __name = "MP4COPY",
+    __parent = _parent_0
+  }, {
+    __index = function(cls, name)
+      local val = rawget(_base_0, name)
+      if val == nil then
+        local parent = rawget(cls, "__parent")
+        if parent then
+          return parent[name]
+        end
+      else
+        return val
+      end
+    end,
+    __call = function(cls, ...)
+      local _self_0 = setmetatable({}, _base_0)
+      cls.__init(_self_0, ...)
+      return _self_0
+    end
+  })
+  _base_0.__class = _class_0
+  if _parent_0.__inherited then
+    _parent_0.__inherited(_parent_0, _class_0)
+  end
+  MP4COPY = _class_0
+end
+formats["Copy"] = MP4COPY()
+local NVENC
+do
+  local _class_0
+  local _parent_0 = Format
+  local _base_0 = {
+    getFlags = function(self)
+      return {
+		"--vf-add=format=fmt=nv12",
+		"--ovcopts-add=preset=p6",
+		"--ovcopts-add=qp=34",
+		"--oacopts=b=64"
+      }
+    end
+  }
+  _base_0.__index = _base_0
+  setmetatable(_base_0, _parent_0.__base)
+  _class_0 = setmetatable({
+    __init = function(self)
+      self.displayName = "NVENC"
+      self.supportsTwopass = false
+      self.videoCodec = "h264_nvenc"
+      self.audioCodec = "libopus"
+      self.outputExtension = "mp4"
+      self.acceptsBitrate = false
+    end,
+    __base = _base_0,
+    __name = "NVENC",
+    __parent = _parent_0
+  }, {
+    __index = function(cls, name)
+      local val = rawget(_base_0, name)
+      if val == nil then
+        local parent = rawget(cls, "__parent")
+        if parent then
+          return parent[name]
+        end
+      else
+        return val
+      end
+    end,
+    __call = function(cls, ...)
+      local _self_0 = setmetatable({}, _base_0)
+      cls.__init(_self_0, ...)
+      return _self_0
+    end
+  })
+  _base_0.__class = _class_0
+  if _parent_0.__inherited then
+    _parent_0.__inherited(_parent_0, _class_0)
+  end
+  NVENC = _class_0
+end
+formats["NVENC"] = NVENC()
 local ogg
 do
   local _class_0
   local _parent_0 = Format
-  local _base_0 = { }
+  local _base_0 = {
+    getFlags = function(self)
+      return {
+		"--oacopts=compression_level=10",
+		"--oacopts=frame_duration=60",
+		"--oacopts=packet_loss=0",
+		"--oacopts=application=audio",
+		"--oacopts=mapping_family=0",	
+		"--oacopts=b=64k"
+      }
+    end
+  }
   _base_0.__index = _base_0
   setmetatable(_base_0, _parent_0.__base)
   _class_0 = setmetatable({
@@ -911,7 +1080,67 @@ local GIF
 do
   local _class_0
   local _parent_0 = Format
-  local _base_0 = { }
+  local _base_0 = {
+    postCommandModifier = function(self, command, region, startTime, endTime)
+      local new_command = { }
+      local start_ts = seconds_to_time_string(startTime, false, true)
+      local end_ts = seconds_to_time_string(endTime, false, true)
+      start_ts = start_ts:gsub(":", "\\\\:")
+      end_ts = end_ts:gsub(":", "\\\\:")
+      local cfilter = "[vid1]trim=start=" .. tostring(start_ts) .. ":end=" .. tostring(end_ts) .. "[vidtmp];"
+      if mp.get_property("deinterlace") == "yes" then
+        cfilter = cfilter .. "[vidtmp]yadif=mode=1[vidtmp];"
+      end
+      for _, v in ipairs(command) do
+        local _continue_0 = false
+        repeat
+          if v:match("^%-%-vf%-add=lavfi%-scale") or v:match("^%-%-vf%-add=lavfi%-crop") or v:match("^%-%-vf%-add=fps") or v:match("^%-%-vf%-add=lavfi%-eq") then
+            local n = v:gsub("^%-%-vf%-add=", ""):gsub("^lavfi%-", "")
+            cfilter = cfilter .. "[vidtmp]" .. tostring(n) .. "[vidtmp];"
+          else
+            if v:match("^%-%-video%-rotate=90") then
+              cfilter = cfilter .. "[vidtmp]transpose=1[vidtmp];"
+            else
+              if v:match("^%-%-video%-rotate=270") then
+                cfilter = cfilter .. "[vidtmp]transpose=2[vidtmp];"
+              else
+                if v:match("^%-%-video%-rotate=180") then
+                  cfilter = cfilter .. "[vidtmp]transpose=1[vidtmp];[vidtmp]transpose=1[vidtmp];"
+                else
+                  if v:match("^%-%-deinterlace=") then
+                    _continue_0 = true
+                    break
+                  else
+                    append(new_command, {
+                      v
+                    })
+                    _continue_0 = true
+                    break
+                  end
+                end
+              end
+            end
+          end
+          _continue_0 = true
+        until true
+        if not _continue_0 then
+          break
+        end
+      end
+      cfilter = cfilter .. "[vidtmp]split[topal][vidf];"
+      cfilter = cfilter .. "[topal]palettegen[pal];"
+      cfilter = cfilter .. "[vidf]fifo[vidf];"
+      if options.gif_dither == 6 then
+        cfilter = cfilter .. "[vidf][pal]paletteuse[vo]"
+      else
+        cfilter = cfilter .. "[vidf][pal]paletteuse=dither=bayer:bayer_scale=" .. tostring(options.gif_dither) .. ":diff_mode=rectangle[vo]"
+      end
+      append(new_command, {
+        "--lavfi-complex=" .. tostring(cfilter)
+      })
+      return new_command
+    end
+  }
   _base_0.__index = _base_0
   setmetatable(_base_0, _parent_0.__base)
   _class_0 = setmetatable({
@@ -951,6 +1180,58 @@ do
   GIF = _class_0
 end
 formats["gif"] = GIF()
+local WEBP
+do
+  local _class_0
+  local _parent_0 = Format
+  local _base_0 = {
+    getFlags = function(self)
+      return {
+        "--ofopts-add=loop=0",
+        "--ovcopts-add=quality=80",
+        "--ovcopts-add=compression_level=5"
+      }
+    end
+  }
+  _base_0.__index = _base_0
+  setmetatable(_base_0, _parent_0.__base)
+  _class_0 = setmetatable({
+    __init = function(self)
+      self.displayName = "WEBP"
+      self.supportsTwopass = false
+      self.videoCodec = "libwebp_anim"
+      self.audioCodec = ""
+      self.outputExtension = "webp"
+      self.acceptsBitrate = false
+    end,
+    __base = _base_0,
+    __name = "WEBP",
+    __parent = _parent_0
+  }, {
+    __index = function(cls, name)
+      local val = rawget(_base_0, name)
+      if val == nil then
+        local parent = rawget(cls, "__parent")
+        if parent then
+          return parent[name]
+        end
+      else
+        return val
+      end
+    end,
+    __call = function(cls, ...)
+      local _self_0 = setmetatable({}, _base_0)
+      cls.__init(_self_0, ...)
+      return _self_0
+    end
+  })
+  _base_0.__class = _class_0
+  if _parent_0.__inherited then
+    _parent_0.__inherited(_parent_0, _class_0)
+  end
+  WEBP = _class_0
+end
+formats["webp"] = WEBP()
 local Page
 do
   local _class_0
@@ -1235,12 +1516,18 @@ append_audio_tracks = function(out, tracks)
 end
 local get_scale_filters
 get_scale_filters = function()
-  if options.scale_height > 0 then
-    return {
-      "lavfi-scale=-2:" .. tostring(options.scale_height)
-    }
+  local filters = { }
+  if options.force_square_pixels then
+    append(filters, {
+      "lavfi-scale=iw*sar:ih"
+    })
   end
-  return { }
+  if options.scale_height > 0 then
+    append(filters, {
+      "lavfi-scale=-2:" .. tostring(options.scale_height)
+    })
+  end
+  return filters
 end
 local get_fps_filters
 get_fps_filters = function()
@@ -1250,6 +1537,21 @@ get_fps_filters = function()
     }
   end
   return { }
+end
+local get_contrast_brightness_and_saturation_filters
+get_contrast_brightness_and_saturation_filters = function()
+  local mpv_brightness = mp.get_property("brightness")
+  local mpv_contrast = mp.get_property("contrast")
+  local mpv_saturation = mp.get_property("saturation")
+  if mpv_brightness == 0 and mpv_contrast == 0 and mpv_saturation == 0 then
+    return { }
+  end
+  local eq_saturation = (mpv_saturation + 100) / 100.0
+  local eq_contrast = (mpv_contrast + 100) / 100.0
+  local eq_brightness = (mpv_brightness / 50.0 + eq_contrast - 1) / 2.0
+  return {
+    "lavfi-eq=contrast=" .. tostring(eq_contrast) .. ":saturation=" .. tostring(eq_saturation) .. ":brightness=" .. tostring(eq_brightness)
+  }
 end
 local append_property
 append_property = function(out, property_name, option_name)
@@ -1284,6 +1586,7 @@ get_playback_options = function()
   append_property(ret, "sub-delay")
   append_property(ret, "video-rotate")
   append_property(ret, "ytdl-format")
+  append_property(ret, "deinterlace")
   return ret
 end
 local get_speed_flags
@@ -1348,6 +1651,7 @@ get_video_filters = function(format, region)
   end
   append(filters, get_scale_filters())
   append(filters, get_fps_filters())
+  append(filters, get_contrast_brightness_and_saturation_filters())
   append(filters, format:getPostFilters())
   return filters
 end
@@ -1451,50 +1755,9 @@ encode = function(region, startTime, endTime)
   if format.videoCodec ~= "" then
     append(command, get_video_encode_flags(format, region))
   end
-  if format.videoCodec == "libx264" then
-  	append(command, {"--vf-add=format=fmt=yuv420p"})
-    	append(command, {"--ovcopts-add=preset=medium"})
-    	append(command, {"--ovcopts-add=level=4.2"})
-	append(command, {"--ofopts-add=movflags=+faststart"})
-	append(command, {"--oacopts=b=" .. tostring(options.audio_bitrate)})
-  end
-  if format.videoCodec == "h264_nvenc" then
-   	append(command, {"--vf-add=format=fmt=nv12"})
-    	append(command, {"--ovcopts-add=preset=hp"})
-	append(command, {"--ovcopts-add=profile=high"})
-	append(command, {"--ovcopts-add=g=60"})
-	append(command, {"--ovcopts-add=qp=17"})
-	append(command, {"--ovcopts-add=qmax=23"})
-	append(command, {"--oacopts=b=320000"})
-  end
-  if format.videoCodec == "libvpx" then
-	append(command, {"--ovcopts-add=deadline=good"})
-	append(command, {"--ovcopts-add=cpu=used=1"})
-	append(command, {"--ovcopts=b=100000000"})
-	append(command, {"--oacopts=b=" .. tostring(options.audio_bitrate)})
-	
-  end
-  if format.videoCodec == "libvpx-vp9" then
-    	append(command, {"--ovcopts-add=deadline=good"})
-	append(command, {"--ovcopts-add=speed=1"})
-	append(command, {"--ovcopts-add=row=mt=1"})
-	append(command, {"--ovcopts=b=0"})
-  end
-  if format.audioCodec == "libopus" then
-	append(command, {"--oacopts=add=compression=level=10"})
-	append(command, {"--oacopts=add=frame=duration=60"})
-	append(command, {"--oacopts=add=application=audio"})
-	append(command, {"--oacopts=b=" .. tostring(options.audio_bitrate)})
-
-  end
   append(command, format:getFlags())
   if options.write_filename_on_metadata then
     append(command, get_metadata_flags())
-  end
-    if options.crf >= 0 then
-      append(command, {
-        "--ovcopts-add=crf=" .. tostring(options.crf)
-      })
   end
   local dir = ""
   if is_stream then
@@ -1511,6 +1774,7 @@ encode = function(region, startTime, endTime)
   append(command, {
     "--o=" .. tostring(out_path)
   })
+  command = format:postCommandModifier(command, region, startTime, endTime)
   msg.info("Encoding to", out_path)
   msg.verbose("Command line:", table.concat(command, " "))
   if options.run_detached then
@@ -1527,10 +1791,10 @@ encode = function(region, startTime, endTime)
         cancellable = false
       })
     else
---	mp.command('no-osd set ontop yes')
+	mp.command('no-osd set ontop yes')
       local ewp = EncodeWithProgress(startTime, endTime)
       res = ewp:startEncode(command)
---	mp.command('no-osd set ontop no')
+	mp.command('no-osd set ontop no')
     end
     if res then
       message("Encode finished")
@@ -1806,7 +2070,7 @@ do
     getDisplayValue = function(self)
       local _exp_0 = self.optType
       if "bool" == _exp_0 then
-        return self.value and "Yes" or "No"
+        return self.value and "yes" or "no"
       elseif "int" == _exp_0 then
         if self.opts.altDisplayNames and self.opts.altDisplayNames[self.value] then
           return self.opts.altDisplayNames[self.value]
@@ -1836,15 +2100,23 @@ do
         ass:append(" ▶")
       end
       return ass:append("\\N")
+    end,
+    optVisible = function(self)
+      if self.visibleCheckFn == nil then
+        return true
+      else
+        return self.visibleCheckFn()
+      end
     end
   }
   _base_0.__index = _base_0
   _class_0 = setmetatable({
-    __init = function(self, optType, displayText, value, opts)
+    __init = function(self, optType, displayText, value, opts, visibleCheckFn)
       self.optType = optType
       self.displayText = displayText
       self.opts = opts
       self.value = 1
+      self.visibleCheckFn = visibleCheckFn
       return self:setValue(value)
     end,
     __base = _base_0,
@@ -1877,11 +2149,21 @@ do
       return self:draw()
     end,
     prevOpt = function(self)
-      self.currentOption = math.max(1, self.currentOption - 1)
+      for i = self.currentOption - 1, 1, -1 do
+        if self.options[i][2]:optVisible() then
+          self.currentOption = i
+          break
+        end
+      end
       return self:draw()
     end,
     nextOpt = function(self)
-      self.currentOption = math.min(#self.options, self.currentOption + 1)
+      for i = self.currentOption + 1, #self.options do
+        if self.options[i][2]:optVisible() then
+          self.currentOption = i
+          break
+        end
+      end
       return self:draw()
     end,
     confirmOpts = function(self)
@@ -1905,11 +2187,13 @@ do
       ass:append(tostring(bold('Options:')) .. "\\N\\N")
       for i, optPair in ipairs(self.options) do
         local opt = optPair[2]
-        opt:draw(ass, self.currentOption == i)
+        if opt:optVisible() then
+          opt:draw(ass, self.currentOption == i)
+        end
       end
-      ass:append("\\N▲ / ▼: Navigate\\N")
-      ass:append(tostring(bold('ENTER:')) .. " Confirm\\N")
-      ass:append(tostring(bold('ESC:')) .. " Cancel\\N")
+      ass:append("\\N▲ / ▼: navigate\\N")
+      ass:append(tostring(bold('ENTER:')) .. " confirm options\\N")
+      ass:append(tostring(bold('ESC:')) .. " cancel\\N")
       return mp.set_osd_ass(window_w, window_h, ass.text)
     end
   }
@@ -1938,8 +2222,8 @@ do
 			"480p"
           },
 		  {
-            540,
-			"540p"
+            576,
+			"576p"
           },
           {
             720,
@@ -1969,17 +2253,25 @@ do
       }
       local crfOpts = {
         step = 1,
-        min = 10,
-		max = 51,
+        min = 23,
+		max = 37,
         altDisplayNames = {
-		[10] = "10 (Nightmare!)",
-		[17] = "17 (Ultra High)",
-		[23] = "23 (Very High)",
-		[26] = "26 (High)",
-		[30] = "30 (Medium)",
-		[37] = "37 (Low)",
-		[45] = "45 (Very Low)",
-		[51] = "51 (Ultra Low)"
+		  [10] = "10 (Nightmare!)",
+		  [17] = "17 (Ultra High)",
+		  [23] = "23 (High)",
+		  [26] = "26 (Medium)",
+          [30] = "30 (Low)",
+		  [37] = "37 (Very Low)",
+          [45] = "45 (Ultra Low)",
+          [52] = "52 (VP8 ONLY)",
+          [53] = "53 (VP8 ONLY)",
+          [54] = "54 (VP8 ONLY)",
+          [55] = "55 (VP8 ONLY)",
+          [56] = "56 (VP8 ONLY)",
+          [57] = "57 (VP8 ONLY)",
+          [58] = "58 (VP8 ONLY)",
+          [59] = "59 (VP8 ONLY)",
+          [60] = "60 (VP8 ONLY)"
         }
       }
 	  local audioOpts = {
@@ -1990,19 +2282,19 @@ do
           },
           {
 			64000,
-			"64k (Ultra Low)"
+			"64k (Very Low)"
           },
           {
 			96000,
-			"96k (Very Low("
+			"96k (Low)"
           },
           {
 			128000,
-			"128k (Low)"
+			"128k (Medium)"
           },
           {
 			160000,
-			"160k (Medium)"
+			"160k (High)"
           },
           {
 			192000, 
@@ -2025,13 +2317,16 @@ do
             "Source"
           },
           {
-            15
+            12
           },
-	  {
+          {
             20
           },
           {
             30
+          },
+          {
+            40
           },
           {
             48
@@ -2041,12 +2336,36 @@ do
           }
         }
       }
+	  local tuneOpts = {
+        possibleValues = {
+          {
+			"",
+			"None"
+          },
+          {
+			"film",
+			"Film"
+          },
+          {
+			"animation",
+			"Animation"
+          },
+          {
+			"grain",
+			"Grain"
+          }
+        }
+      }
       local formatIds = {
         "mp4",
-        "webm-vp8",
---	"webm-vp9",
+--		"NVENC",
+--		"AV1",
+		"Copy",
+--		"webm-vp8",
+--		"webm-vp9",
         "ogg",
-	"mp4-nvenc"
+		"gif",
+--		"webp"
       }
       local formatOpts = {
         possibleValues = (function()
@@ -2063,34 +2382,72 @@ do
           return _accum_0
         end)()
       }
+      local gifDitherOpts = {
+        possibleValues = {
+          {
+            0,
+            "bayer_scale 0"
+          },
+          {
+            1,
+            "bayer_scale 1"
+          },
+          {
+            2,
+            "bayer_scale 2"
+          },
+          {
+            3,
+            "bayer_scale 3"
+          },
+          {
+            4,
+            "bayer_scale 4"
+          },
+          {
+            5,
+            "bayer_scale 5"
+          },
+          {
+            6,
+            "sierra2_4a"
+          }
+        }
+      }
       self.options = {
         {
           "output_format",
           Option("list", "Output Format", options.output_format, formatOpts)
         },
         {
-          "apply_current_filters",
-         Option("bool", "Apply Filters", options.apply_current_filters)
-        },
-	{
-          "write_filename_on_metadata",
-          Option("bool", "Write Metadata", options.write_filename_on_metadata)
-        },
-        {
           "crf",
-          Option("int", "V-Quality", options.crf, crfOpts)
+          Option("int", "V-Quality", options.crf, crfOpts, function()
+            return self.options[1][2]:getValue() == "mp4"
+          end)
         },
-	{
+		{
           "audio_bitrate",
-	  Option("list", "A-Quality", options.audio_bitrate, audioOpts)
-	},
-	{
+		  Option("list", "A-Quality", options.audio_bitrate, audioOpts)
+		},
+		{
           "scale_height",
           Option("list", "Scale Height", options.scale_height, scaleHeightOpts)
         },
         {
           "fps",
           Option("list", "Framerate", options.fps, fpsOpts)
+        },
+        {
+          "tune",
+          Option("list", "Tune", options.tune, tuneOpts, function()
+            return self.options[1][2]:getValue() == "mp4"
+          end)
+        },
+        {
+          "gif_dither",
+          Option("list", "Dither Type", options.gif_dither, gifDitherOpts, function()
+            return self.options[1][2]:getValue() == "gif"
+          end)
         }
       }
       self.keybinds = {
