@@ -2360,11 +2360,11 @@ do
         "mp4",
 --		"NVENC",
 --		"AV1",
-		"Copy",
+	"Copy",
 --		"webm-vp8",
---		"webm-vp9",
+	"webm-vp9",
         "ogg",
-		"gif",
+	"gif",
 --		"webp"
       }
       local formatOpts = {
@@ -2422,31 +2422,37 @@ do
         {
           "crf",
           Option("int", "V-Quality", options.crf, crfOpts, function()
-            return self.options[1][2]:getValue() == "mp4"
+			return self.options[1][2]:getValue() == "mp4"
           end)
         },
 		{
           "audio_bitrate",
-		  Option("list", "A-Quality", options.audio_bitrate, audioOpts)
-		},
+		  Option("list", "A-Quality", options.audio_bitrate, audioOpts, function()
+			return (self.options[1][2]:getValue() == "mp4") or (self.options[1][2]:getValue() == "ogg")
+          end)
+        },
 		{
           "scale_height",
-          Option("list", "Scale Height", options.scale_height, scaleHeightOpts)
+          Option("list", "Scale Height", options.scale_height, scaleHeightOpts, function()
+			return (self.options[1][2]:getValue() == "mp4") or (self.options[1][2]:getValue() == "gif")
+          end)
         },
         {
           "fps",
-          Option("list", "Framerate", options.fps, fpsOpts)
+          Option("list", "Framerate", options.fps, fpsOpts, function()
+			return (self.options[1][2]:getValue() == "mp4") or (self.options[1][2]:getValue() == "gif")
+          end)
         },
         {
           "tune",
           Option("list", "Tune", options.tune, tuneOpts, function()
-            return self.options[1][2]:getValue() == "mp4"
+			return self.options[1][2]:getValue() == "mp4"
           end)
         },
         {
           "gif_dither",
           Option("list", "Dither Type", options.gif_dither, gifDitherOpts, function()
-            return self.options[1][2]:getValue() == "gif"
+			return self.options[1][2]:getValue() == "gif"
           end)
         }
       }
