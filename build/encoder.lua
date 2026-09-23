@@ -9,7 +9,7 @@ local mpopts = require("mp.options")
 local options = {
 	-- General
 	keybind = "e",
-	output_directory = [[~/desktop]],
+	output_directory = "",
 	output_template = "%T-[%S-%E]",
 	output_format = "mp4", -- mp4, WebM, NVENC, Audio, Animated, or Basket
 	scale_height = -1,
@@ -1146,7 +1146,7 @@ do
       elseif options.audio_codec_audio == "aac" then
         return "m4a"
       end
-      return "opus"
+      return "ogg"
     end,
     getFlags = function(self)
       return {
@@ -1161,7 +1161,7 @@ do
       self.displayName = "Audio"
       self.videoCodec = ""
       self.audioCodec = "libopus"
-      self.outputExtension = "opus"
+      self.outputExtension = "ogg"
     end,
     __base = _base_0,
     __name = "Audio",
