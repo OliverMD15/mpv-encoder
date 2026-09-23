@@ -3,6 +3,8 @@ local assdraw = require("mp.assdraw")
 local msg = require("mp.msg")
 local utils = require("mp.utils")
 local mpopts = require("mp.options")
+local is_windows = type(package) == "table" and type(package.config) == "string" and package.config:sub(1, 1) == "\\"
+local default_mpv_executable = is_windows and "mpv.exe" or "mpv"
 
 -- User configuration. Keep this block limited to settings a user might edit;
 -- runtime state, helpers, and implementation details belong below it.
@@ -14,9 +16,9 @@ local options = {
 	output_format = "mp4", -- mp4, WebM, NVENC, Audio, Animated, or Basket
 	scale_height = -1,
 	fps = -1,
-	vfr = false, -- preserve timestamps while removing duplicate frames; mutually exclusive with fps
-	filter_policy = "safe-only", -- inherit, safe-only, or ignore
+	apply_current_filters = true, -- inherit mpv's active video filters
 	downmix_audio = true,
+	mpv_executable = default_mpv_executable, -- child mpv executable; may be an absolute path
 
 	-- UI
 	font_size = 20,
@@ -45,6 +47,7 @@ local options = {
 	video_codec_nvenc = "av1_nvenc", -- h264_nvenc, hevc_nvenc, or av1_nvenc
 	cq_nvenc = 30,
 	cq_nvenc_av1 = 35,
+	target_size_nvenc_mb = 0, -- 0 = Off, 20 or 200 MB; complete file including audio
 
 	-- Audio-only
 	audio_codec_audio = "libopus", -- libopus, aac, or libmp3lame
@@ -59,15 +62,12 @@ local options = {
 	-- Basket
 	video_codec_basket = "libx264", -- libx264 or libvpx-vp9
 	target_size_basket_mb = 4,
-	-- Target-size mode searches quickly, then re-encodes once with these
-	-- higher-quality settings. Audio remains a separate .ogg file.
-	basket_search_preset = "medium",
+	-- Native two-pass target mode uses a fast analysis pass and these final
+	-- settings. Audio remains a separate .ogg file outside the video target.
 	basket_final_preset = "veryslow",
 	basket_first_pass_speed = 4,
 	basket_search_second_pass_speed = 2,
-	basket_final_second_pass_speed = 0,
-	basket_final_attempts = 2,
-	basket_target_tolerance = 0.95
+	basket_final_second_pass_speed = 0
 }
 
 -- Read legacy names as aliases so existing encoder.conf files keep working.
@@ -122,14 +122,6 @@ if options.output_format == "GIF" then
   msg.warn("Deprecated output_format=GIF detected; using Animated")
   options.output_format = "Animated"
 end
-if options.filter_policy ~= "inherit" and options.filter_policy ~= "safe-only" and options.filter_policy ~= "ignore" then
-  msg.warn("Unknown filter_policy '" .. tostring(options.filter_policy) .. "'; using safe-only")
-  options.filter_policy = "safe-only"
-end
-if options.vfr and options.fps ~= -1 then
-  msg.warn("vfr=true overrides fps=" .. tostring(options.fps) .. "; using Source framerate")
-  options.fps = -1
-end
 if options.target_size_mp4_mb ~= 0 and options.target_size_mp4_mb ~= 20 and options.target_size_mp4_mb ~= 200 then
   msg.warn("target_size_mp4_mb must be 0, 20, or 200; using Off")
   options.target_size_mp4_mb = 0
@@ -137,6 +129,10 @@ end
 if options.target_size_av1_mb ~= 0 and options.target_size_av1_mb ~= 20 and options.target_size_av1_mb ~= 200 then
   msg.warn("target_size_av1_mb must be 0, 20, or 200; using Off")
   options.target_size_av1_mb = 0
+end
+if options.target_size_nvenc_mb ~= 0 and options.target_size_nvenc_mb ~= 20 and options.target_size_nvenc_mb ~= 200 then
+  msg.warn("target_size_nvenc_mb must be 0, 20, or 200; using Off")
+  options.target_size_nvenc_mb = 0
 end
 local bold
 bold = function(text)
@@ -345,13 +341,6 @@ parse_directory = function(dir)
   dir, _ = dir:gsub("^~", home_dir)
   return dir
 end
-local get_null_path
-get_null_path = function()
-  if file_exists("/dev/null") then
-    return "/dev/null"
-  end
-  return "NUL"
-end
 local calculate_scale_factor
 calculate_scale_factor = function()
   local baseResY = 720
@@ -375,7 +364,9 @@ do
 end
 local get_pass_logfile_path
 get_pass_logfile_path = function(encode_out_path)
-  return tostring(encode_out_path) .. "-video-pass1-" .. instance_id .. ".log"
+  -- mpv's libavcodec encoding driver chooses this path automatically when
+  -- AV_CODEC_FLAG_PASS1/PASS2 is enabled.
+  return tostring(encode_out_path) .. "-video-pass1.log"
 end
 local dimensions_changed = true
 local _video_dimensions = { }
@@ -618,105 +609,40 @@ end
 local formats = { }
 local video_codec_profiles = {
   ["libvpx-vp9"] = {
-    displayName = "VP9",
-    extension = "webm",
-    deferPlainColorFilter = true,
-    clampFilter = "limiter=min=0:max=1023",
-    twoPass = true,
-    pass1Muxer = "webm",
-    targetSize = {
-      crfMin = 31,
-      crfMax = 60,
-      initialCrf = 45,
-      fineStep = 1,
-      maxAttempts = 8,
-      integerQuality = true,
-      getFinalOffset = function()
-        -- Lower VP9 speed is slower and usually more efficient.
-        local delta = (options.basket_search_second_pass_speed or 2) - (options.basket_final_second_pass_speed or 0)
-        if delta > 0 then
-          return -math.ceil(delta / 2)
-        end
-        return 0
-      end
-    }
+    displayName = "VP9", extension = "webm",
+    deferPlainColorFilter = true, clampFilter = "lavfi-limiter=min=0:max=1023",
+    normalTwoPass = true, targetTwoPass = true, targetSize = true,
+    bitrateMin = 64000, bitrateMax = 100000000
   },
   ["libx264"] = {
-    displayName = "AVC",
-    extension = "mp4",
-    twoPass = false,
-    -- MP4 target-size mode uses a fast search pass and the configured
-    -- preset for final candidates. Keep this separate from Basket's
-    -- video-only target-size profile.
-    mp4TargetSize = {
-      crfMin = 23,
-      crfMax = 40,
-      initialCrf = 30,
-      fineStep = 0.25,
-      maxAttempts = 30,
-      integerQuality = false,
-      finalAttempts = 2,
-      tolerance = 0.95
-    },
-    targetSize = {
-      crfMin = 23,
-      crfMax = 40,
-      initialCrf = 30,
-      fineStep = 0.25,
-      maxAttempts = 30,
-      integerQuality = false,
-      getFinalOffset = function()
-        local rank = { ultrafast = 0, superfast = 1, veryfast = 2, faster = 3, fast = 4, medium = 5, slow = 6, slower = 7, veryslow = 8 }
-        local searchRank = rank[options.basket_search_preset] or rank.medium
-        local finalRank = rank[options.basket_final_preset] or rank.veryslow
-        if finalRank > searchRank then
-          return -math.ceil((finalRank - searchRank) / 2)
-        elseif finalRank < searchRank then
-          return math.ceil((searchRank - finalRank) / 2)
-        end
-        return 0
-      end
-    }
+    displayName = "AVC", extension = "mp4",
+    targetTwoPass = true, targetSize = true,
+    bitrateMin = 64000, bitrateMax = 100000000
   },
   ["libx265"] = {
-    displayName = "HEVC",
-    extension = "mp4",
-    twoPass = false,
-    mp4TargetSize = {
-      crfMin = 23,
-      crfMax = 45,
-      initialCrf = 30,
-      fineStep = 0.25,
-      maxAttempts = 30,
-      integerQuality = false,
-      finalAttempts = 2,
-      tolerance = 0.95
-    }
+    displayName = "HEVC", extension = "mp4",
+    targetTwoPass = false, targetSize = true,
+    bitrateMin = 48000, bitrateMax = 100000000
   },
   ["libsvtav1"] = {
-    displayName = "AV1",
-    extension = "mp4",
-    twoPass = false,
-    targetSize = {
-      crfMin = 25, crfMax = 60, initialCrf = 40,
-      fineStep = 1, maxAttempts = 8, integerQuality = true,
-      finalAttempts = 2, tolerance = 0.95
-    }
+    displayName = "AV1", extension = "webm",
+    targetTwoPass = false, targetSize = true,
+    bitrateMin = 32000, bitrateMax = 100000000
   },
   ["h264_nvenc"] = {
-    displayName = "NVENC AVC",
-    extension = "mp4",
-    twoPass = false
+    displayName = "NVENC AVC", extension = "mp4",
+    targetTwoPass = false, targetSize = true, requiresNativeMultipass = true,
+    bitrateMin = 128000, bitrateMax = 200000000
   },
   ["hevc_nvenc"] = {
-    displayName = "NVENC HEVC",
-    extension = "mp4",
-    twoPass = false
+    displayName = "NVENC HEVC", extension = "mp4",
+    targetTwoPass = false, targetSize = true, requiresNativeMultipass = true,
+    bitrateMin = 96000, bitrateMax = 200000000
   },
   ["av1_nvenc"] = {
-    displayName = "NVENC AV1",
-    extension = "mp4",
-    twoPass = false
+    displayName = "NVENC AV1", extension = "mp4",
+    targetTwoPass = false, targetSize = true, requiresNativeMultipass = true,
+    bitrateMin = 96000, bitrateMax = 200000000
   }
 }
 local get_codec_color_filters
@@ -747,11 +673,20 @@ get_audio_bitrate = function(codec)
   end
   return options.opus_bitrate
 end
+local get_native_audio_codec
+get_native_audio_codec = function(codec)
+  -- Current libavcodec exposes the native Opus encoder to mpv as "opus"
+  -- even though the conventional library-style name is "libopus".
+  if codec == "libopus" then
+    return "opus"
+  end
+  return tostring(codec)
+end
 local get_audio_encode_flags
 get_audio_encode_flags = function(codec)
   return {
-    "-c:a", tostring(codec),
-    "-b:a", tostring(get_audio_bitrate(codec))
+    "--oac=" .. get_native_audio_codec(codec),
+    "--oacopts-add=b=" .. tostring(get_audio_bitrate(codec))
   }
 end
 local get_video_color_params
@@ -781,10 +716,10 @@ get_color_tag_flags = function(prefilter_value)
   local has_libplacebo = tostring(prefilter_value):find("libplacebo", 1, true) ~= nil
   if has_libplacebo or not is_hdr_source() then
     return {
-      "-colorspace", "bt709",
-      "-color_primaries", "bt709",
-      "-color_trc", "bt709",
-      "-color_range", "tv"
+      "--ovcopts-add=colorspace=bt709",
+      "--ovcopts-add=color_primaries=bt709",
+      "--ovcopts-add=color_trc=bt709",
+      "--ovcopts-add=color_range=tv"
     }
   end
   return { }
@@ -828,159 +763,139 @@ get_sdr_normalization_filter = function(format)
 end
 
 local get_vp9_video_flags
-get_vp9_video_flags = function(pass, speed, crf)
-  -- Shared between the "WebM" format's VP9 option and "Basket"'s -- video-
-  -- side flags only, no audio (WebM muxes it, Basket never does; each
-  -- caller appends its own audio handling, or none).
-  -- Constant-quality, two-pass, tuned for heavily bitrate-starved output
-  -- rather than raw archival quality -- CRF still governs quality/size,
-  -- left alone here.
+get_vp9_video_flags = function(pass, speed, ctx)
   local fps = options.fps > -1 and options.fps or (mp.get_property_native("container-fps") or 30)
   local flags = {
-    "-c:v", "libvpx-vp9",
-    "-crf", tostring(crf or options.crf_webm),
-    "-b:v", "0",
-    "-deadline", "good",
-    -- WebM defaults to fast analysis / slow final encoding. Basket passes
-    -- its own search/final speeds explicitly.
-    "-speed", tostring(speed or (pass == 1 and 4 or 0)),
-    "-profile:v", "2",
-    "-row-mt", "1",
-    "-tile-columns", "0",
-    "-aq-mode", "1",
-    "-g", tostring(math.floor(fps * 10 + 0.5)),
-    "-frame-parallel", "0"
+    "--ovc=libvpx-vp9",
+    "--ovcopts-add=deadline=good",
+    "--ovcopts-add=speed=" .. tostring(speed or (pass == 1 and 4 or 0)),
+    "--ovcopts-add=profile=2",
+    "--ovcopts-add=row-mt=1",
+    "--ovcopts-add=tile-columns=0",
+    "--ovcopts-add=aq-mode=1",
+    "--ovcopts-add=g=" .. tostring(math.floor(fps * 10 + 0.5)),
+    "--ovcopts-add=frame-parallel=0"
   }
-  -- These tools improve the actual encoded stream. Pass 1 only generates
-  -- rate-control statistics, so avoid spending time on them there.
+  if ctx and ctx.targetBitrate then
+    flags[#flags + 1] = "--ovcopts-add=b=" .. tostring(ctx.targetBitrate)
+  else
+    flags[#flags + 1] = "--ovcopts-add=crf=" .. tostring(options.crf_webm)
+    flags[#flags + 1] = "--ovcopts-add=b=0"
+  end
   if pass ~= 1 then
     append(flags, {
-      "-lag-in-frames", "25",
-      "-auto-alt-ref", "6",
-      "-arnr-maxframes", "7",
-      "-arnr-strength", "4",
-      "-arnr-type", "3",
-      "-enable-tpl", "1"
-    })
-  end
-  if pass then
-    append(flags, {
-      "-pass", tostring(pass)
+      "--ovcopts-add=lag-in-frames=25",
+      "--ovcopts-add=auto-alt-ref=6",
+      "--ovcopts-add=arnr-maxframes=7",
+      "--ovcopts-add=arnr-strength=4",
+      "--ovcopts-add=arnr-type=3",
+      "--ovcopts-add=enable-tpl=1"
     })
   end
   append(flags, get_color_tag_flags(options.color_filter_10bit))
   return flags
 end
 local get_mp4_video_flags
-get_mp4_video_flags = function(codec, qualityProfile, crf)
+get_mp4_video_flags = function(codec, ctx, presetOverride)
   local preset = codec == "libx265" and options.preset_hevc or options.preset_avc
-  if qualityProfile == "search" then
-    preset = "fast"
-  end
+  preset = presetOverride or preset
   local tune = codec == "libx265" and options.tune_hevc or options.tune_avc
   local flags = {
-    "-c:v", codec,
-    "-preset", tostring(preset),
-    "-crf", tostring(crf or options.crf_mp4),
-    "-movflags", "+faststart"
+    "--ovc=" .. codec,
+    "--ovcopts-add=preset=" .. tostring(preset),
+    "--ofopts-add=movflags=+faststart"
   }
-  if tune ~= "" then
-    append(flags, {
-      "-tune", tostring(tune)
-    })
+  if ctx and ctx.targetBitrate then
+    flags[#flags + 1] = "--ovcopts-add=b=" .. tostring(ctx.targetBitrate)
+  else
+    flags[#flags + 1] = "--ovcopts-add=crf=" .. tostring(options.crf_mp4)
   end
-  if codec == "libx265" then
-    append(flags, {
-      "-tag:v", "hvc1"
-    })
+  if tune ~= "" then
+    flags[#flags + 1] = "--ovcopts-add=tune=" .. tostring(tune)
   end
   append(flags, get_color_tag_flags(options.color_filter_8bit))
   return flags
 end
 local get_svt_av1_video_flags
-get_svt_av1_video_flags = function(pass, qualityProfile, presetStage, crf)
+get_svt_av1_video_flags = function(ctx)
   local preset = tonumber(options.preset_av1) or 6
-  if presetStage == "search" then
-    preset = 8
-  elseif presetStage == "near" then
-    preset = 6
-  elseif presetStage == "final" then
-    preset = 4
-  elseif type(presetStage) == "number" then
-    crf = presetStage
-  else
-    crf = presetStage or crf
-  end
   local flags = {
-    "-c:v", "libsvtav1",
-    "-preset", tostring(preset),
-    "-crf", tostring(crf or options.crf_webm),
-    "-svtav1-params", "tune=1:enable-variance-boost=1:enable-qm=1:ac-bias=1:tf-strength=1:qp-scale-compress-strength=1:sharpness=1:keyint=10s"
+    "--ovc=libsvtav1",
+    "--ovcopts-add=preset=" .. tostring(preset),
+    "--ovcopts-add=svtav1-params=tune=1:enable-variance-boost=1:enable-qm=1:ac-bias=1:tf-strength=1:qp-scale-compress-strength=1:sharpness=1:keyint=10s"
   }
+  if ctx and ctx.targetBitrate then
+    flags[#flags + 1] = "--ovcopts-add=b=" .. tostring(ctx.targetBitrate)
+  else
+    flags[#flags + 1] = "--ovcopts-add=crf=" .. tostring(options.crf_webm)
+  end
   append(flags, get_color_tag_flags(options.color_filter_10bit))
   return flags
 end
 local get_basket_x264_video_flags
-get_basket_x264_video_flags = function(qualityProfile, crf)
-  local flags = {
-    "-c:v", "libx264",
-    "-preset", qualityProfile == "search" and options.basket_search_preset or options.basket_final_preset,
-    "-crf", tostring(crf or options.crf_mp4),
-    "-movflags", "+faststart",
-    "-tune", "animation"
-  }
-  append(flags, get_color_tag_flags(options.color_filter_8bit))
+get_basket_x264_video_flags = function(_pass, ctx)
+  -- libx264 requires pass-affecting settings (including the preset's b-frame
+  -- policy) to match between both native passes. Its own fast-first-pass path
+  -- supplies the analysis optimization; changing presets makes pass 2 reject
+  -- the statistics file.
+  local preset = options.basket_final_preset
+  local flags = get_mp4_video_flags("libx264", ctx, preset)
+  flags[#flags + 1] = "--ovcopts-add=tune=animation"
   return flags
 end
-video_codec_profiles["libx264"].mp4Flags = function(qualityProfile, crf, presetStage)
-  return get_mp4_video_flags("libx264", qualityProfile, crf, presetStage)
+video_codec_profiles["libx264"].mp4Flags = function(ctx)
+  return get_mp4_video_flags("libx264", ctx)
 end
 video_codec_profiles["libx264"].basketFlags = get_basket_x264_video_flags
-video_codec_profiles["libx265"].mp4Flags = function(qualityProfile, crf, presetStage)
-  return get_mp4_video_flags("libx265", qualityProfile, crf, presetStage)
+video_codec_profiles["libx265"].mp4Flags = function(ctx)
+  return get_mp4_video_flags("libx265", ctx)
 end
 video_codec_profiles["libsvtav1"].flags = get_svt_av1_video_flags
 video_codec_profiles["libvpx-vp9"].flags = get_vp9_video_flags
 local get_nvenc_video_flags
-get_nvenc_video_flags = function(codec)
-  -- Static "best possible quality, speed doesn't matter" settings.
-  -- h264_nvenc has no UHQ tune, so only HEVC/AV1 use it.
+get_nvenc_video_flags = function(codec, ctx)
   local tune = codec == "h264_nvenc" and "hq" or "uhq"
   local cq = codec == "av1_nvenc" and options.cq_nvenc_av1 or options.cq_nvenc
   local flags = {
-    "-c:v", codec,
-    "-preset", "p7",
-    "-tune", tune,
-    "-rc", "vbr",
-    "-cq", tostring(cq),
-    "-multipass", "fullres",
-    "-spatial-aq", "1",
-    "-temporal-aq", "1",
-    "-rc-lookahead", "32",
-    "-b_ref_mode", "each",
-    "-movflags", "+faststart"
+    "--ovc=" .. codec,
+    "--ovcopts-add=preset=p7",
+    "--ovcopts-add=tune=" .. tune,
+    "--ovcopts-add=spatial-aq=1",
+    "--ovcopts-add=temporal-aq=1",
+    "--ovcopts-add=rc-lookahead=32",
+    "--ovcopts-add=b_ref_mode=each",
+    "--ofopts-add=movflags=+faststart"
   }
+  if ctx and ctx.targetBitrate then
+    local bitrate = tostring(ctx.targetBitrate)
+    append(flags, {
+      "--ovcopts-add=multipass=fullres",
+      "--ovcopts-add=rc=cbr",
+      "--ovcopts-add=b=" .. bitrate,
+      "--ovcopts-add=minrate=" .. bitrate,
+      "--ovcopts-add=maxrate=" .. bitrate,
+      "--ovcopts-add=bufsize=" .. tostring(ctx.targetBitrate * 2)
+    })
+  else
+    append(flags, {
+      "--ovcopts-add=rc=vbr",
+      "--ovcopts-add=cq=" .. tostring(cq)
+    })
+  end
   if codec == "av1_nvenc" then
-    append(flags, {
-      "-pix_fmt", "p010le",
-      "-lookahead_level", "3"
-    })
-  elseif codec == "hevc_nvenc" then
-    append(flags, {
-      "-tag:v", "hvc1"
-    })
+    flags[#flags + 1] = "--ovcopts-add=lookahead_level=3"
   end
   append(flags, get_color_tag_flags(options.color_filter_8bit))
   return flags
 end
-video_codec_profiles["h264_nvenc"].flags = function()
-  return get_nvenc_video_flags("h264_nvenc")
+video_codec_profiles["h264_nvenc"].flags = function(ctx)
+  return get_nvenc_video_flags("h264_nvenc", ctx)
 end
-video_codec_profiles["hevc_nvenc"].flags = function()
-  return get_nvenc_video_flags("hevc_nvenc")
+video_codec_profiles["hevc_nvenc"].flags = function(ctx)
+  return get_nvenc_video_flags("hevc_nvenc", ctx)
 end
-video_codec_profiles["av1_nvenc"].flags = function()
-  return get_nvenc_video_flags("av1_nvenc")
+video_codec_profiles["av1_nvenc"].flags = function(ctx)
+  return get_nvenc_video_flags("av1_nvenc", ctx)
 end
 local Format
 do
@@ -1007,18 +922,25 @@ do
     getTargetSizeProfile = function(self)
       return self:getCodecProfile().targetSize
     end,
-    supportsTwoPass = function(self)
-      return self:getCodecProfile().twoPass == true
+    supportsTwoPass = function(self, ctx)
+      local profile = self:getCodecProfile()
+      if ctx and ctx.targetBitrate then
+        return profile.targetTwoPass == true
+      end
+      return profile.normalTwoPass == true
     end,
     getCodecFlags = function(self)
       local codecs = { }
       if self:getVideoCodec() == "" then
-        codecs[#codecs + 1] = "-vn"
+        codecs[#codecs + 1] = "--vid=no"
       end
       if self:getAudioCodec() == "" then
-        codecs[#codecs + 1] = "-an"
+        codecs[#codecs + 1] = "--aid=no"
       end
       return codecs
+    end,
+    getMuxer = function(self)
+      return self.outputMuxer
     end,
     getExtension = function(self)
       return self.outputExtension
@@ -1031,6 +953,7 @@ do
       self.videoCodec = ""
       self.audioCodec = ""
       self.outputExtension = ""
+      self.outputMuxer = nil
     end,
     __base = _base_0,
     __name = "Format"
@@ -1061,12 +984,11 @@ do
         tostring(options.color_filter_8bit)
       }
     end,
-    getTargetSizeProfile = function(self)
-      return self:getCodecProfile().mp4TargetSize
-    end,
-    getFlags = function(self, pass, qualityProfile, crf, presetStage)
-      local flags = self:getCodecProfile().mp4Flags(qualityProfile, crf, presetStage)
-      append(flags, get_audio_encode_flags(options.audio_codec_muxed))
+    getFlags = function(self, ctx, pass)
+      local flags = self:getCodecProfile().mp4Flags(ctx)
+      if pass ~= 1 then
+        append(flags, get_audio_encode_flags(options.audio_codec_muxed))
+      end
       return flags
     end
   }
@@ -1077,6 +999,7 @@ do
       self.videoCodec = tostring(options.video_codec_mp4)
       self.audioCodec = tostring(options.audio_codec_muxed)
       self.outputExtension = "mp4"
+      self.outputMuxer = "mp4"
     end,
     __base = _base_0,
     __name = "MP4",
@@ -1104,12 +1027,12 @@ do
     getExtension = function(self)
       return self:getCodecProfile().extension or self.outputExtension
     end,
-    getFlags = function(self, pass, qualityProfile, crf, presetStage)
+    getFlags = function(self, ctx, pass)
       local flags
       if self:getVideoCodec() == "libsvtav1" then
-        flags = self:getCodecProfile().flags(pass, qualityProfile, presetStage, crf)
+        flags = self:getCodecProfile().flags(ctx)
       else
-        flags = self:getCodecProfile().flags(pass)
+        flags = self:getCodecProfile().flags(pass, nil, ctx)
       end
       if pass ~= 1 then
         append(flags, get_audio_encode_flags("libopus"))
@@ -1123,7 +1046,8 @@ do
       self.displayName = "WebM"
       self.videoCodec = "libsvtav1"
       self.audioCodec = "libopus"
-      self.outputExtension = "mp4"
+      self.outputExtension = "webm"
+      self.outputMuxer = "webm"
     end,
     __base = _base_0,
     __name = "WebM",
@@ -1148,11 +1072,16 @@ do
       end
       return "ogg"
     end,
+    getMuxer = function(self)
+      if options.audio_codec_audio == "aac" then
+        return "ipod"
+      elseif options.audio_codec_audio == "libmp3lame" then
+        return "mp3"
+      end
+      return "ogg"
+    end,
     getFlags = function(self)
-      return {
-        "-c:a", tostring(options.audio_codec_audio),
-        "-b:a", tostring(get_audio_bitrate(options.audio_codec_audio))
-      }
+      return get_audio_encode_flags(options.audio_codec_audio)
     end
   }
   _base_0.__index = _base_0
@@ -1162,6 +1091,7 @@ do
       self.videoCodec = ""
       self.audioCodec = "libopus"
       self.outputExtension = "ogg"
+      self.outputMuxer = "ogg"
     end,
     __base = _base_0,
     __name = "Audio",
@@ -1183,11 +1113,11 @@ do
     end,
     getFlags = function(self)
       return {
-        "-c:v", "libwebp_anim",
-        "-loop", "0",
-        "-lossless", "0",
-        "-compression_level", tostring(options.compression_level_webp),
-        "-q:v", tostring(options.quality_webp)
+        "--ovc=libwebp_anim",
+        "--ofopts-add=loop=0",
+        "--ovcopts-add=lossless=0",
+        "--ovcopts-add=compression_level=" .. tostring(options.compression_level_webp),
+        "--ovcopts-add=quality=" .. tostring(options.quality_webp)
       }
     end
   }
@@ -1198,6 +1128,7 @@ do
       self.videoCodec = "libwebp_anim"
       self.audioCodec = ""
       self.outputExtension = "webp"
+      self.outputMuxer = "webp"
     end,
     __base = _base_0,
     __name = "Animated",
@@ -1230,9 +1161,11 @@ do
         filter
       }
     end,
-    getFlags = function(self)
-      local flags = self:getCodecProfile().flags()
-      append(flags, get_audio_encode_flags(options.audio_codec_muxed))
+    getFlags = function(self, ctx, pass)
+      local flags = self:getCodecProfile().flags(ctx)
+      if pass ~= 1 then
+        append(flags, get_audio_encode_flags(options.audio_codec_muxed))
+      end
       return flags
     end
   }
@@ -1243,6 +1176,7 @@ do
       self.videoCodec = "nvenc"
       self.audioCodec = "libopus"
       self.outputExtension = "mp4"
+      self.outputMuxer = "mp4"
     end,
     __base = _base_0,
     __name = "NVENC",
@@ -1278,18 +1212,23 @@ do
     getExtension = function(self)
       return self:getCodecProfile().extension or self.outputExtension
     end,
-    getFlags = function(self, pass, quality_profile, crf)
+    getMuxer = function(self)
+      return self:getVideoCodec() == "libvpx-vp9" and "webm" or "mp4"
+    end,
+    getFlags = function(self, ctx, pass)
       local profile = self:getCodecProfile()
-      if profile.twoPass then
-        local speed = options.basket_search_second_pass_speed
+      if self:supportsTwoPass(ctx) and self:getVideoCodec() == "libvpx-vp9" then
+        local speed
         if pass == 1 then
           speed = options.basket_first_pass_speed
-        elseif quality_profile == "final" then
+        elseif ctx and ctx.targetBitrate then
           speed = options.basket_final_second_pass_speed
+        else
+          speed = options.basket_search_second_pass_speed
         end
-        return profile.flags(pass, speed, crf)
+        return profile.flags(pass, speed, ctx)
       end
-      return profile.basketFlags(quality_profile, crf)
+      return profile.basketFlags(pass, ctx)
     end
   }
   _base_0.__index = _base_0
@@ -1299,6 +1238,7 @@ do
       self.videoCodec = "video"
       self.audioCodec = ""
       self.outputExtension = "mp4"
+      self.outputMuxer = "mp4"
     end,
     __base = _base_0,
     __name = "Basket",
@@ -1413,9 +1353,8 @@ do
   _base_0.__class = _class_0
   Page = _class_0
 end
--- One coroutine owns a complete job, including Basket attempts and both
--- VP9 passes. Only subprocess waits yield; the existing cleanup paths still
--- run on failure/cancellation. No shell is involved in launching FFmpeg.
+-- One coroutine owns a complete job, including Basket audio/video staging and
+-- native two-pass encodes.
 local active_encode
 local function track_encode_file(path)
   if active_encode and path then active_encode.files[path] = true end
@@ -1424,7 +1363,7 @@ end
 local function cancel_encode()
   if not active_encode then return end
   active_encode.cancelled = true
-  if active_encode.request then mp.abort_async_command(active_encode.request) end
+  if active_encode.request then active_encode.request:abort() end
 end
 local function retain_encode_file(path)
   if path and active_encode then active_encode.files[path] = nil end
@@ -1452,7 +1391,7 @@ local function resume_encode(...)
   if not ok or coroutine.status(job.thread) == "dead" then
     if not ok then
       msg.error("Encode error: " .. tostring(err))
-      if job.request then mp.abort_async_command(job.request) end
+      if job.request then job.request:abort() end
       if job.timer then job.timer:kill() end
       if job.page then job.page:hide() end
       for path in pairs(job.files) do os.remove(path) end
@@ -1463,7 +1402,7 @@ local function resume_encode(...)
     finish_encode(job, job.cancelled and "cancelled" or (ok and err == true and "finished" or "failed"), 0)
   end
 end
--- Defer unloading long enough to reap FFmpeg and clean its files. This also
+-- Defer unloading long enough to reap child mpv and clean its files. This also
 -- covers normal window closing, before mpv tears down the scripting runtime.
 mp.add_hook("on_unload", 50, function(hook)
   if not active_encode then return end
@@ -1478,6 +1417,168 @@ mp.register_event("shutdown", function()
   for path in pairs(active_encode.files) do os.remove(path) end
 end)
 local EncodeWithProgress
+-- Windows uses an inherited anonymous pipe instead of a temporary progress
+-- script/file. CreateProcessW also avoids the console window from io.popen.
+local windows_progress_process
+if is_windows then
+  local available, ffi = pcall(require, "ffi")
+  if available then
+    ffi.cdef[[
+      typedef void *HANDLE;
+      typedef unsigned long DWORD;
+      typedef int BOOL;
+      typedef unsigned short WORD;
+      typedef struct {
+        DWORD nLength; void *lpSecurityDescriptor; BOOL bInheritHandle;
+      } SECURITY_ATTRIBUTES;
+      typedef struct {
+        DWORD cb; wchar_t *lpReserved; wchar_t *lpDesktop; wchar_t *lpTitle;
+        DWORD dwX; DWORD dwY; DWORD dwXSize; DWORD dwYSize;
+        DWORD dwXCountChars; DWORD dwYCountChars; DWORD dwFillAttribute;
+        DWORD dwFlags; WORD wShowWindow; WORD cbReserved2;
+        unsigned char *lpReserved2; HANDLE hStdInput; HANDLE hStdOutput;
+        HANDLE hStdError;
+      } STARTUPINFOW;
+      typedef struct {
+        HANDLE hProcess; HANDLE hThread; DWORD dwProcessId; DWORD dwThreadId;
+      } PROCESS_INFORMATION;
+      BOOL __stdcall CreatePipe(HANDLE *, HANDLE *, SECURITY_ATTRIBUTES *, DWORD);
+      BOOL __stdcall SetHandleInformation(HANDLE, DWORD, DWORD);
+      BOOL __stdcall CloseHandle(HANDLE);
+      BOOL __stdcall CreateProcessW(const wchar_t *, wchar_t *, void *, void *,
+        BOOL, DWORD, void *, const wchar_t *, STARTUPINFOW *, PROCESS_INFORMATION *);
+      BOOL __stdcall PeekNamedPipe(HANDLE, void *, DWORD, DWORD *, DWORD *, DWORD *);
+      BOOL __stdcall ReadFile(HANDLE, void *, DWORD, DWORD *, void *);
+      DWORD __stdcall WaitForSingleObject(HANDLE, DWORD);
+      BOOL __stdcall GetExitCodeProcess(HANDLE, DWORD *);
+      BOOL __stdcall TerminateProcess(HANDLE, unsigned int);
+      int __stdcall MultiByteToWideChar(unsigned int, DWORD, const char *, int,
+        wchar_t *, int);
+      DWORD __stdcall GetLastError(void);
+    ]]
+    local win = ffi.load("kernel32")
+    local function wide(value)
+      local count = win.MultiByteToWideChar(65001, 0, value, #value, nil, 0)
+      if count == 0 then return nil end
+      local buffer = ffi.new("wchar_t[?]", count + 1)
+      if win.MultiByteToWideChar(65001, 0, value, #value, buffer, count) == 0 then
+        return nil
+      end
+      return buffer
+    end
+    local function quote_arg(value)
+      value = tostring(value)
+      local parts, slashes = { '"' }, 0
+      for i = 1, #value do
+        local c = value:sub(i, i)
+        if c == "\\" then
+          slashes = slashes + 1
+        elseif c == '"' then
+          parts[#parts + 1] = string.rep("\\", slashes * 2 + 1) .. '"'
+          slashes = 0
+        else
+          parts[#parts + 1] = string.rep("\\", slashes) .. c
+          slashes = 0
+        end
+      end
+      parts[#parts + 1] = string.rep("\\", slashes * 2) .. '"'
+      return table.concat(parts)
+    end
+    windows_progress_process = function(args)
+      local parts = {}
+      for i, arg in ipairs(args) do parts[i] = quote_arg(arg) end
+      local command = wide(table.concat(parts, " "))
+      if not command then return nil, "Could not convert encoder command to UTF-16" end
+      local attributes = ffi.new("SECURITY_ATTRIBUTES")
+      attributes.nLength = ffi.sizeof(attributes)
+      attributes.bInheritHandle = 1
+      local outputRead, outputWrite = ffi.new("HANDLE[1]"), ffi.new("HANDLE[1]")
+      local inputRead, inputWrite = ffi.new("HANDLE[1]"), ffi.new("HANDLE[1]")
+      if win.CreatePipe(outputRead, outputWrite, attributes, 0) == 0 then
+        return nil, "CreatePipe failed (" .. tonumber(win.GetLastError()) .. ")"
+      end
+      if win.CreatePipe(inputRead, inputWrite, attributes, 0) == 0 then
+        win.CloseHandle(outputRead[0])
+        win.CloseHandle(outputWrite[0])
+        return nil, "CreatePipe failed (" .. tonumber(win.GetLastError()) .. ")"
+      end
+      local function close_setup_handles()
+        win.CloseHandle(outputRead[0])
+        win.CloseHandle(outputWrite[0])
+        win.CloseHandle(inputRead[0])
+        win.CloseHandle(inputWrite[0])
+      end
+      if win.SetHandleInformation(outputRead[0], 1, 0) == 0 or
+          win.SetHandleInformation(inputWrite[0], 1, 0) == 0 then
+        local code = tonumber(win.GetLastError())
+        close_setup_handles()
+        return nil, "SetHandleInformation failed (" .. code .. ")"
+      end
+      local startup = ffi.new("STARTUPINFOW")
+      startup.cb = ffi.sizeof(startup)
+      startup.dwFlags = 0x100 -- STARTF_USESTDHANDLES
+      startup.hStdInput = inputRead[0]
+      startup.hStdOutput = outputWrite[0]
+      startup.hStdError = outputWrite[0]
+      local info = ffi.new("PROCESS_INFORMATION")
+      local started = win.CreateProcessW(nil, command, nil, nil, 1,
+        0x08000000, nil, nil, startup, info) -- CREATE_NO_WINDOW
+      local code = tonumber(win.GetLastError())
+      win.CloseHandle(outputWrite[0])
+      win.CloseHandle(inputRead[0])
+      win.CloseHandle(inputWrite[0])
+      if started == 0 then
+        win.CloseHandle(outputRead[0])
+        return nil, "CreateProcessW failed (" .. code .. ")"
+      end
+      win.CloseHandle(info.hThread)
+      local process = { handle = info.hProcess, output = outputRead[0], buffer = "" }
+      function process:read_lines(on_line)
+        local availableBytes, bytesRead = ffi.new("DWORD[1]"), ffi.new("DWORD[1]")
+        for _ = 1, 64 do
+          if win.PeekNamedPipe(self.output, nil, 0, nil, availableBytes, nil) == 0 or
+              availableBytes[0] == 0 then break end
+          local count = math.min(tonumber(availableBytes[0]), 8192)
+          local chunk = ffi.new("char[?]", count)
+          if win.ReadFile(self.output, chunk, count, bytesRead, nil) == 0 or
+              bytesRead[0] == 0 then break end
+          self.buffer = self.buffer .. ffi.string(chunk, tonumber(bytesRead[0]))
+          while true do
+            local boundary = self.buffer:find("[\r\n]")
+            if not boundary then break end
+            local line = self.buffer:sub(1, boundary - 1)
+            self.buffer = self.buffer:sub(boundary + 1)
+            if line ~= "" then on_line(line) end
+          end
+          if #self.buffer > 65536 then self.buffer = self.buffer:sub(-65536) end
+        end
+      end
+      function process:finished()
+        return win.WaitForSingleObject(self.handle, 0) == 0
+      end
+      function process:exit_code()
+        local exitCode = ffi.new("DWORD[1]")
+        if win.GetExitCodeProcess(self.handle, exitCode) == 0 then return nil end
+        return tonumber(exitCode[0])
+      end
+      function process:abort()
+        win.TerminateProcess(self.handle, 1)
+      end
+      function process:close()
+        win.CloseHandle(self.output)
+        win.CloseHandle(self.handle)
+      end
+      return process
+    end
+  end
+end
+local function popen_progress_process(args)
+  local quoted = {}
+  for i, arg in ipairs(args) do
+    quoted[i] = "'" .. tostring(arg):gsub("'", "'\\''") .. "'"
+  end
+  return io.popen(table.concat(quoted, " ") .. " 2>&1")
+end
 do
   local _class_0
   local _parent_0 = Page
@@ -1493,36 +1594,19 @@ do
       ass:new_event()
       self:setup_text(ass)
       ass:append(tostring(self.label) .. " (" .. tostring(bold(progressText)) .. ")")
-      if self.fps then
-        ass:append(" at " .. string.format("%.1f fps", self.fps))
-      end
-      if self.speed then
-        if self.fps then
-          ass:append(" (" .. tostring(self.speed) .. ")")
-        else
-          ass:append(" at " .. tostring(self.speed))
-        end
-      end
-      ass:append("\\NESC: Cancel")
+      if is_windows and windows_progress_process then ass:append("\\NESC: Cancel") end
       return mp.set_osd_ass(window_w, window_h, ass.text)
     end,
-    parseLine = function(self, line)
-      local outTimeUs = string.match(line, "^out_time_us=(%d+)")
-      if outTimeUs then
-        self.elapsed = math.max(self.elapsed, tonumber(outTimeUs) / 1000000)
-      end
-      local h, m, s = string.match(line, "^out_time=(%d+):(%d+):([%d%.]+)")
-      if h ~= nil and not outTimeUs then
-        local elapsed = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
-        self.elapsed = math.max(self.elapsed, elapsed)
-      end
-      local speed = string.match(line, "^speed=(.+)")
-      if speed and speed ~= "N/A" then
-        self.speed = speed
-      end
-      local fps = tonumber(string.match(line, "^fps=([%d%.]+)"))
-      if fps and fps > 0 then
-        self.fps = fps
+    parseProgress = function(self, value)
+      local timePos = tonumber(value:match("Encode time%-pos:%s*([%d%.]+)"))
+      if timePos and timePos >= 0 then
+        self.elapsed = math.max(self.elapsed, timePos - self.startTime)
+        local percent = self.duration > 0 and
+          math.floor(math.max(0, math.min(100, 100 * self.elapsed / self.duration))) or 0
+        if percent ~= self.lastLoggedPercent then
+          self.lastLoggedPercent = percent
+          msg.verbose("Encode progress: " .. percent .. "%")
+        end
       end
     end,
     startEncode = function(self, command_line)
@@ -1539,71 +1623,85 @@ do
       end
       local job = active_encode
       if job.cancelled then return false end
-      -- A separate file lets mpv remain responsive while FFmpeg runs.
       job.sequence = job.sequence + 1
-      local outputDir = utils.split_path(command_line[#command_line])
-      -- Pass 1 writes NUL, so keep progress next to the real job output.
-      local progressPath = track_encode_file(utils.join_path(job.directory or outputDir,
-        ".encoder-progress-" .. instance_id .. "-" .. job.sequence .. ".txt"))
-      local output = table.remove(copy_command_line)
       append(copy_command_line, {
-        "-nostdin", "-loglevel", "error",
-        "-stats_period", "0.25",
-        "-progress", progressPath,
-        "-nostats"
+        "--term-status-msg=Encode time-pos: " .. "$" .. "{=time-pos}\\n"
       })
-      table.insert(copy_command_line, output)
       self:show()
       job.page = self
-      local offset, pending = 0, ""
-      local function poll()
-        local fd = io.open(progressPath, "rb")
-        if not fd then return end
-        fd:seek("set", offset)
-        local chunk = fd:read("*a") or ""
-        offset = offset + #chunk
-        fd:close()
-        pending = pending .. chunk
-        local last = 1
-        for line, nextPos in pending:gmatch("([^\n]*)\n()") do
-          self:parseLine((line:gsub("\r$", "")))
-          last = nextPos
+      if is_windows then
+        if not windows_progress_process then
+          self:hide()
+          job.page = nil
+          msg.error("File-free progress on Windows requires an mpv build with LuaJIT FFI")
+          return false
         end
-        pending = pending:sub(last)
-        self:draw()
+        local process, startError = windows_progress_process(copy_command_line)
+        if not process then
+          self:hide()
+          job.page = nil
+          msg.error("Couldn't start child mpv: " .. tostring(startError))
+          return false
+        end
+        local lastOutput = ""
+        local function on_line(line)
+          lastOutput = (lastOutput .. line .. "\n"):sub(-8192)
+          self:parseProgress(line)
+          self:draw()
+        end
+        job.request = process
+        job.timer = mp.add_periodic_timer(0.1, function()
+          process:read_lines(on_line)
+          if not process:finished() then return end
+          process:read_lines(on_line)
+          if process.buffer ~= "" then on_line(process.buffer) end
+          local exitCode = process:exit_code()
+          process:close()
+          job.request = nil
+          job.timer:kill()
+          job.timer = nil
+          self:hide()
+          job.page = nil
+          if exitCode ~= 0 and not job.cancelled then
+            msg.error("Child mpv failed (" .. tostring(exitCode) .. "): " .. lastOutput)
+          end
+          resume_encode(exitCode == 0 and not job.cancelled)
+        end)
+        mp.commandv("script-message", "encoder-stage", tostring(job.sequence))
+        return coroutine.yield()
       end
-      job.timer = mp.add_periodic_timer(0.25, poll)
-      job.request = mp.command_native_async({
-        name = "subprocess", args = copy_command_line, playback_only = false,
-        capture_stdout = false, capture_stderr = true,
-      }, function(success, result, err)
-        job.request = nil
-        job.timer:kill()
-        job.timer = nil
-        poll()
+      -- On Unix, retain the original mpv-webm streaming reader. It blocks
+      -- this script's event handling, not the player's playback core.
+      local process, startError = popen_progress_process(copy_command_line)
+      if not process then
         self:hide()
         job.page = nil
-        os.remove(progressPath)
-        local passed = success and result and result.status == 0 and not job.cancelled
-        if not passed and not job.cancelled then
-          local detail = result and result.stderr
-          if not detail or detail == "" then detail = result and result.error_string or err end
-          msg.error("FFmpeg failed: " .. tostring(detail))
-        end
-        resume_encode(passed)
-      end)
-      return coroutine.yield()
+        msg.error("Couldn't start child mpv: " .. tostring(startError))
+        return false
+      end
+      local lastOutput = ""
+      for line in process:lines() do
+        lastOutput = (lastOutput .. line .. "\n"):sub(-8192)
+        self:parseProgress(line)
+        self:draw()
+      end
+      local closeOk = process:close()
+      self:hide()
+      job.page = nil
+      if not closeOk and not job.cancelled then
+        msg.error("Child mpv failed: " .. lastOutput)
+      end
+      return closeOk == true and not job.cancelled
     end
   }
   _base_0.__index = _base_0
   _class_0 = make_class({
     __init = function(self, startTime, endTime, label)
       self.duration = endTime - startTime
+      self.startTime = startTime
       self.elapsed = 0
       self.label = label or "Encoding"
-      self.fps = nil
-      self.speed = nil
-      self.keybinds = { ESC = cancel_encode }
+      self.keybinds = is_windows and { ESC = cancel_encode } or {}
     end,
     __base = _base_0,
     __name = "EncodeWithProgress",
@@ -1617,117 +1715,100 @@ run_encode_command = function(command, startTime, endTime, label)
   local progress = EncodeWithProgress(startTime, endTime, label)
   return progress:startEncode(command)
 end
-local get_stream_maps
-get_stream_maps = function(format, skip_video)
-  -- Maps whatever mpv currently has active (vid/aid) onto the ffmpeg
-  -- stream indices ffmpeg needs for -map, via track-list's ff-index.
-  -- PoC scope: single active track only, internal (non-external-file)
-  -- tracks only, no multi-track audio mixing.
-  -- skip_video: when the video output comes from a -filter_complex label
-  -- instead (image-based subtitle burn-in), the caller maps it itself.
-  local maps = { }
-  local videoCodec = format.getVideoCodec and format:getVideoCodec() or format.videoCodec
-  local audioCodec = format.getAudioCodec and format:getAudioCodec() or format.audioCodec
-  local want_video = videoCodec ~= "" and not skip_video
-  local want_audio = audioCodec ~= "" and not mp.get_property_bool("mute")
-  for _, track in ipairs(mp.get_property_native("track-list")) do
-    if track["selected"] and not track["external"] and track["ff-index"] then
-      if track["type"] == "video" and want_video then
-        append(maps, {
-          "-map", "0:" .. tostring(track["ff-index"])
-        })
-        want_video = false
-      elseif track["type"] == "audio" and want_audio then
-        append(maps, {
-          "-map", "0:" .. tostring(track["ff-index"])
-        })
-        want_audio = false
-      end
+local get_active_tracks
+get_active_tracks = function()
+  local accepted = {
+    video = true,
+    audio = not mp.get_property_bool("mute"),
+    sub = mp.get_property_bool("sub-visibility", true)
+  }
+  local active = { video = { }, audio = { }, sub = { } }
+  for _, track in ipairs(mp.get_property_native("track-list") or { }) do
+    if track.selected and accepted[track.type] and active[track.type] then
+      active[track.type][#active[track.type] + 1] = track
     end
   end
-  if audioCodec ~= "" and want_audio then
-    -- No selected internal audio track was mapped: suppress auto-selection.
-    append(maps, { "-an" })
-  elseif mp.get_property_bool("mute") then
-    append(maps, { "-an" })
+  return active
+end
+local append_track
+append_track = function(out, track)
+  local externalFlag = { audio = "audio-file", sub = "sub-file" }
+  local internalFlag = { video = "vid", audio = "aid", sub = "sid" }
+  if track.external and externalFlag[track.type] and track["external-filename"] then
+    out[#out + 1] = "--" .. externalFlag[track.type] .. "=" .. tostring(track["external-filename"])
+  elseif internalFlag[track.type] and track.id then
+    out[#out + 1] = "--" .. internalFlag[track.type] .. "=" .. tostring(track.id)
   end
-  return maps
+end
+local append_audio_tracks
+append_audio_tracks = function(out, tracks)
+  local internal = { }
+  for _, track in ipairs(tracks) do
+    if track.external then
+      append_track(out, track)
+    else
+      internal[#internal + 1] = track
+    end
+  end
+  if #internal > 1 then
+    local labels = { }
+    for _, track in ipairs(internal) do
+      labels[#labels + 1] = "[aid" .. tostring(track.id) .. "]"
+    end
+    out[#out + 1] = "--lavfi-complex=" .. table.concat(labels) .. "amix[ao]"
+  elseif #internal == 1 then
+    append_track(out, internal[1])
+  end
+end
+local get_track_flags
+get_track_flags = function(format)
+  local out = { }
+  local active = get_active_tracks()
+  local wants = {
+    video = format:getVideoCodec() ~= "",
+    audio = format:getAudioCodec() ~= "" and not mp.get_property_bool("mute"),
+    sub = format:getVideoCodec() ~= "" and mp.get_property_bool("sub-visibility", true)
+  }
+  for _, kind in ipairs({ "video", "audio", "sub" }) do
+    local tracks = wants[kind] and active[kind] or { }
+    if kind == "audio" then
+      append_audio_tracks(out, tracks)
+    else
+      for _, track in ipairs(tracks) do
+        append_track(out, track)
+      end
+    end
+    if #tracks == 0 then
+      out[#out + 1] = "--" .. ({ video = "vid", audio = "aid", sub = "sid" })[kind] .. "=no"
+    end
+  end
+  return out
 end
 local get_scale_filters
 get_scale_filters = function()
   local filters = { }
-  local scaleFlags = ":flags=lanczos+accurate_rnd+full_chroma_inp"
   if options.scale_height > 0 then
     append(filters, {
-      "scale=-2:" .. tostring(options.scale_height) .. scaleFlags
+      "lavfi-scale=-2:" .. tostring(options.scale_height) .. ":flags=lanczos+accurate_rnd+full_chroma_inp"
     })
   end
   return filters
 end
 local get_fps_filters
 get_fps_filters = function()
-  -- Unlike mpv's encode mode (which writes VFR timestamps on a generic
-  -- 24000fps timebase unless told otherwise), ffmpeg demuxing+encoding
-  -- directly preserves the source's real frame timing on its own, so
-  -- "Source" (-1) genuinely means "don't touch it" here.
 	-- Explicit FPS conversion always removes near-duplicate frames first. The
 	-- one-frame drop cap catches the common A,A / B,B pattern without letting a
 	-- long low-motion scene collapse into a handful of frames.
-	if options.vfr then
+	if options.fps > -1 then
 		return {
-			"mpdecimate=max=1"
-		}
-	elseif options.fps > -1 then
-		return {
-			"mpdecimate=max=1",
+			"lavfi-mpdecimate=max=1",
 			"fps=" .. tostring(options.fps)
 		}
 	end
 	return { }
 end
-local get_fps_output_args
-get_fps_output_args = function()
-	if options.vfr then
-		return {
-			"-fps_mode:v", "vfr"
-		}
-	elseif options.fps > -1 then
-		return {
-			"-fps_mode:v", "cfr"
-		}
-	end
-	return { }
-end
 local append_current_filters
-local safe_filter_parameters = {
-  crop = { w = true, h = true, out_w = true, out_h = true, x = true, y = true, keep_aspect = true, exact = true },
-  scale = { w = true, h = true, width = true, height = true, flags = true, force_original_aspect_ratio = true, force_divisible_by = true },
-  fps = { fps = true, start_time = true, round = true, eof_action = true },
-  format = { pix_fmts = true, color_spaces = true, color_ranges = true },
-  setsar = { sar = true, ratio = true, r = true, max = true },
-  setdar = { dar = true, ratio = true, r = true, max = true },
-  transpose = { dir = true, passthrough = true },
-  hflip = {},
-  vflip = {}
-}
-local function safe_filter_params(name, params)
-  local allowed = safe_filter_parameters[name]
-  if not allowed then
-    return false
-  end
-  for key, value in pairs(params) do
-    if not allowed[key] or (type(value) ~= "string" and type(value) ~= "number") then
-      return false
-    end
-    -- Conservative subset: no graph separators, quoting, or escaping.
-    -- Complex expressions remain available through the inherit policy.
-    if tostring(value):find("[^%w_%.%+%-%*/%(%)| ]") then
-      return false
-    end
-  end
-  return true
-end
-append_current_filters = function(filters, policy)
+append_current_filters = function(filters)
   local vf = mp.get_property_native("vf")
   if not vf then
     return 
@@ -1735,145 +1816,31 @@ append_current_filters = function(filters, policy)
   for _index_0 = 1, #vf do
     local filter = vf[_index_0]
     if filter["enabled"] ~= false then
-      -- mpv prefixes some filter names with "lavfi-" to select the
-      -- libavfilter version over its own native one (e.g. "lavfi-crop").
-      -- ffmpeg only knows the plain libavfilter name.
-      local name = string.gsub(filter["name"], "^lavfi%-", "")
+      local name = tostring(filter.name)
       local params = filter["params"] or { }
-      if policy == "safe-only" and not safe_filter_params(name, params) then
-        msg.warn("Skipping unsupported filter or parameters in safe-only mode: " .. tostring(filter["name"]))
-      else
-        local parts = { }
-        for k, v in pairs(params) do
-          parts[#parts + 1] = tostring(k) .. "=" .. tostring(v)
-        end
-        table.sort(parts)
-        local str = name
-        if #parts > 0 then
-          str = str .. "=" .. table.concat(parts, ":")
-        end
-        append(filters, {
-          str
-        })
+      local parts = { }
+      for key, value in pairs(params) do
+        value = tostring(value)
+        parts[#parts + 1] = tostring(key) .. "=%" .. tostring(#value) .. "%" .. value
       end
-    end
-  end
-end
-local escape_subtitle_path
-escape_subtitle_path = function(path)
-  -- Escaping for the ffmpeg "subtitles" filter's filename= value: a
-  -- literal backslash becomes "\\", a literal colon becomes "\:" (colon
-  -- is the filter's key/value separator), and the whole thing is wrapped
-  -- in single quotes below, with any literal quote backslash-escaped too.
-  path = path:gsub("\\", "\\\\")
-  path = path:gsub(":", "\\:")
-  path = path:gsub("'", "\\'")
-  return path
-end
-local image_subtitle_codecs = {
-  hdmv_pgs_subtitle = true,
-  dvd_subtitle = true,
-  dvb_subtitle = true,
-  xsub = true
-}
-local get_subtitle_info
-get_subtitle_info = function(path)
-  -- Automatically burns in whatever subtitle track mpv currently has
-  -- selected and visible -- no separate on/off option. `selected` means
-  -- the track is loaded/active (mpv's sid); `sub-visibility` is the
-  -- separate toggle `cycle sub-visibility` (default key `v`) flips, which
-  -- hides rendering without deselecting the track, so both are checked.
-  -- mode == "text": bitmap-free subs (ass/srt/webvtt/mov_text/etc),
-  --   rendered via the libass-based "subtitles" ffmpeg filter.
-  -- mode == "image": bitmap subs (hdmv_pgs_subtitle/dvd_subtitle/
-  --   dvb_subtitle/xsub), composited via -filter_complex overlay onto
-  --   the raw decoded video, since libass can't render these. Only
-  --   supported for tracks embedded in the file currently playing.
-  if not mp.get_property_bool("sub-visibility", true) then
-    return nil
-  end
-  local track_list = mp.get_property_native("track-list")
-  local target = nil
-  for _, track in ipairs(track_list) do
-    if track["type"] == "sub" and track["selected"] then
-      target = track
-      break
-    end
-  end
-  if not target then
-    return nil
-  end
-  if image_subtitle_codecs[target["codec"]] then
-    if target["external"] then
-      message("Burn subtitles: external image-based subtitles aren't supported")
-      return nil
-    end
-    if not target["ff-index"] then
-      message("Burn subtitles: couldn't resolve subtitle stream")
-      return nil
-    end
-    return {
-      mode = "image",
-      ffIndex = target["ff-index"]
-    }
-  end
-  local subPath
-  local streamIndex = nil
-  if target["external"] then
-    subPath = target["external-filename"]
-  else
-    subPath = path
-    local idx = 0
-    for _, track in ipairs(track_list) do
-      if track["type"] == "sub" and not track["external"] then
-        if track["id"] == target["id"] then
-          streamIndex = idx
-          break
-        end
-        idx = idx + 1
+      table.sort(parts)
+      if #parts > 0 then
+        name = name .. ":" .. table.concat(parts, ":")
       end
-    end
-    if streamIndex == nil then
-      streamIndex = 0
+      filters[#filters + 1] = name
     end
   end
-  if not subPath then
-    message("Burn subtitles: couldn't resolve subtitle file")
-    return nil
-  end
-  local filterStr = "subtitles=filename='" .. escape_subtitle_path(subPath) .. "'"
-  if streamIndex then
-    filterStr = filterStr .. ":si=" .. tostring(streamIndex)
-  end
-  return {
-    mode = "text",
-    filterStr = filterStr,
-    isExternal = target["external"] == true
-  }
 end
 local get_video_filters
-get_video_filters = function(format, region, subtitleFilter, subtitleOffset)
+get_video_filters = function(format, region)
   local filters = { }
-  if subtitleFilter then
-    -- ffmpeg normalizes output timestamps to start at 0 when "-ss" is
-    -- given before "-i" (input seeking), but the subtitles filter still
-    -- matches events against the *original* absolute timeline. Shift
-    -- timestamps forward before the subtitles filter and back after, so
-    -- subtitle timing lines up without desyncing the actual output.
-    append(filters, {
-      "setpts=PTS+" .. tostring(subtitleOffset) .. "/TB"
-    })
-  end
   append(filters, format:getPreFilters())
-  if options.filter_policy ~= "ignore" then
-    -- Picks up anything a live playback-side script (e.g. autocrop.lua)
-    -- has already inserted into mpv's active filter chain, so it carries
-    -- over into the encode instead of being silently dropped.
-    append_current_filters(filters, options.filter_policy)
+  if options.apply_current_filters then
+    append_current_filters(filters)
   end
   if region and region:is_valid() then
     append(filters, {
-      "crop=" .. tostring(region.w) .. ":" .. tostring(region.h) .. ":" .. tostring(region.x) .. ":" .. tostring(region.y)
+      "lavfi-crop=" .. tostring(region.w) .. ":" .. tostring(region.h) .. ":" .. tostring(region.x) .. ":" .. tostring(region.y)
     })
   end
   append(filters, get_scale_filters())
@@ -1885,145 +1852,157 @@ get_video_filters = function(format, region, subtitleFilter, subtitleOffset)
     })
   end
   append(filters, format:getPostFilters())
-  if subtitleFilter then
-    append(filters, {
-      subtitleFilter
-    })
-    append(filters, {
-      "setpts=PTS-" .. tostring(subtitleOffset) .. "/TB"
-    })
-  end
   return filters
 end
 local build_video_filter_args
 build_video_filter_args = function(ctx)
-  local format = ctx.format
-  local subtitleFilter = ctx.subInfo and ctx.subInfo.filterStr or nil
-  local subtitleOffset = (ctx.subInfo and ctx.subInfo.isExternal) and ctx.originalStartTime or ctx.startTime
-  local filters = get_video_filters(format, ctx.region, subtitleFilter, subtitleOffset)
-
-  if not ctx.useImageOverlay then
-    if #filters == 0 then
-      return { }
-    end
-    return {
-      "-vf", table.concat(filters, ",")
-    }
+  local args = { }
+  for _, filter in ipairs(get_video_filters(ctx.format, ctx.region)) do
+    args[#args + 1] = "--vf-add=" .. filter
   end
-
-  local graph = ""
-  local videoLabel = "[0:v]"
-  for _, track in ipairs(mp.get_property_native("track-list")) do
-    if track.type == "video" and track.selected and not track.external and track["ff-index"] then
-      videoLabel = "[0:" .. tostring(track["ff-index"]) .. "]"
-      break
-    end
+  return args
+end
+local function append_property(out, propertyName, optionName)
+  local value = mp.get_property(propertyName)
+  if value and value ~= "" then
+    out[#out + 1] = "--" .. tostring(optionName or propertyName) .. "=" .. tostring(value)
   end
-  local sourceLabel = videoLabel
-  if ctx.useImageOverlay then
-    graph = videoLabel .. "[0:" .. tostring(ctx.subInfo.ffIndex) .. "]overlay[cbi_base]"
-    sourceLabel = "[cbi_base]"
+end
+local get_playback_options
+get_playback_options = function()
+  local out = { }
+  append_property(out, "video-rotate")
+  append_property(out, "deinterlace")
+  return out
+end
+local get_sub_options
+get_sub_options = function()
+  local out = { }
+  for _, name in ipairs({
+    "sub-ass-override", "sub-ass-style-overrides", "sub-ass-use-video-data",
+    "sub-pos", "sub-delay", "sub-scale", "sub-font", "sub-font-size",
+    "sub-bold", "sub-italic", "sub-color", "sub-back-color",
+    "sub-border-color", "sub-border-size", "sub-shadow-color",
+    "sub-shadow-offset", "sub-use-margins", "sub-margin-x", "sub-margin-y",
+    "sub-align-x", "sub-align-y", "sub-spacing", "sub-justify",
+    "sub-gauss", "sub-gray"
+  }) do
+    append_property(out, name)
   end
-  if #filters > 0 then
-    if graph ~= "" then
-      graph = graph .. ";"
-    end
-    graph = graph .. sourceLabel .. table.concat(filters, ",") .. "[cbi_filtered]"
-    sourceLabel = "[cbi_filtered]"
-  end
-
-  local outputLabel = "[cbi_out]"
-  if sourceLabel ~= outputLabel then
-    if graph == "" then
-      graph = sourceLabel .. "null[cbi_out]"
-    else
-      graph = graph .. ";" .. sourceLabel .. "null[cbi_out]"
-    end
-  end
-  return {
-    "-filter_complex", graph,
-    "-map", outputLabel
-  }
+  return out
 end
 local build_encode_command
 build_encode_command = function(ctx)
   local command = {
-    "ffmpeg",
-    "-y",
-    "-ss", seconds_to_time_string(ctx.startTime, false, true),
-    "-i", ctx.path,
-    "-t", tostring(ctx.endTime - ctx.startTime)
+    tostring(options.mpv_executable),
+    ctx.path,
+    "--no-config",
+    "--start=" .. seconds_to_time_string(ctx.startTime, false, true),
+    "--end=" .. seconds_to_time_string(ctx.endTime, false, true),
+    "--loop-file=no",
+    "--no-pause",
+    "--no-keep-open",
+    "--input-default-bindings=no",
+    "--osc=no"
   }
-  append(command, get_stream_maps(ctx.format, ctx.useImageOverlay))
+  append(command, get_track_flags(ctx.format))
   append(command, ctx.format:getCodecFlags())
+  local muxer = ctx.format:getMuxer()
+  if muxer then
+    command[#command + 1] = "--of=" .. tostring(muxer)
+  end
   if ctx.format:getAudioCodec() ~= "" and options.downmix_audio then
-    append(command, {
-      "-ac", "2"
-    })
+    command[#command + 1] = "--audio-channels=stereo"
   end
   if ctx.format:getVideoCodec() == "" then
     return command
   end
+  append(command, get_playback_options())
+  append(command, get_sub_options())
   append(command, build_video_filter_args(ctx))
-  append(command, get_fps_output_args())
   return command
 end
 local build_encode_variants
-build_encode_variants = function(ctx, targetPath, qualityProfile, crf, presetStage)
+build_encode_variants = function(ctx, targetPath)
   local format = ctx.format
   local baseCommand = copy_list(ctx.baseCommand or build_encode_command(ctx))
   local variants = {
     passlog = nil,
+    x264Stats = nil,
     pass1 = nil,
     final = nil
   }
-  if format:supportsTwoPass() then
-    local codecProfile = format:getCodecProfile()
+  if format:supportsTwoPass(ctx) then
     variants.passlog = get_pass_logfile_path(targetPath)
-    track_encode_file(variants.passlog .. "-0.log")
-    track_encode_file(variants.passlog .. "-0.log.mbtree")
+    track_encode_file(variants.passlog)
+    track_encode_file(variants.passlog .. ".mbtree")
+    -- Older mpv releases used the VO driver's historical name here.
+    track_encode_file(targetPath .. "-vo-lavc-pass1.log")
+    track_encode_file(targetPath .. "-vo-lavc-pass1.log.mbtree")
+    if format:getVideoCodec() == "libx264" then
+      variants.x264Stats = track_encode_file(targetPath .. "-x264_2pass.log")
+      track_encode_file(variants.x264Stats .. ".mbtree")
+    end
     variants.pass1 = copy_list(baseCommand)
-    append(variants.pass1, format:getFlags(1, qualityProfile, crf, presetStage))
+    append(variants.pass1, format:getFlags(ctx, 1))
+    if variants.x264Stats then
+      variants.pass1[#variants.pass1 + 1] = "--ovcopts-add=stats=" .. variants.x264Stats
+    end
     append(variants.pass1, {
-      "-an",
-      "-passlogfile", variants.passlog,
-      "-f", codecProfile.pass1Muxer or "null",
-      get_null_path()
+      "--aid=no",
+      "--ovcopts-add=flags=+pass1",
+      "--o=" .. targetPath
     })
     variants.final = copy_list(baseCommand)
-    append(variants.final, format:getFlags(2, qualityProfile, crf, presetStage))
+    append(variants.final, format:getFlags(ctx, 2))
+    if variants.x264Stats then
+      variants.final[#variants.final + 1] = "--ovcopts-add=stats=" .. variants.x264Stats
+    end
     append(variants.final, {
-      "-passlogfile", variants.passlog,
-      targetPath
+      "--ovcopts-add=flags=+pass2",
+      "--o=" .. targetPath
     })
   else
     variants.final = baseCommand
-    append(variants.final, format:getFlags(nil, qualityProfile, crf, presetStage))
-    table.insert(variants.final, targetPath)
+    append(variants.final, format:getFlags(ctx, nil))
+    table.insert(variants.final, "--o=" .. targetPath)
   end
   return variants
 end
 local remove_pass_logs
-remove_pass_logs = function(passlog)
+remove_pass_logs = function(passlog, x264Stats)
   if not passlog then
     return
   end
-  os.remove(passlog .. "-0.log")
-  os.remove(passlog .. "-0.log.mbtree")
+  os.remove(passlog)
+  os.remove(passlog .. ".mbtree")
+  local legacyPasslog = passlog:gsub("%-video%-pass1%.log$", "-vo-lavc-pass1.log")
+  os.remove(legacyPasslog)
+  os.remove(legacyPasslog .. ".mbtree")
+  if x264Stats then
+    os.remove(x264Stats)
+    os.remove(x264Stats .. ".mbtree")
+  end
 end
 local run_encode_variants
 run_encode_variants = function(variants, startTime, endTime, label)
   if variants.pass1 then
     msg.info("Encoding pass 1/2 (analysis)")
     if not run_encode_command(variants.pass1, startTime, endTime, label .. " pass 1/2") then
-      remove_pass_logs(variants.passlog)
+      remove_pass_logs(variants.passlog, variants.x264Stats)
       return false, "pass1"
+    end
+    -- Pass 1 may leave a non-publishable analysis container at --o. The
+    -- second child mpv must start with a clean destination.
+    for _, arg in ipairs(variants.pass1) do
+      local passOutput = arg:match("^%-%-o=(.+)$")
+      if passOutput then os.remove(passOutput) end
     end
   end
 
   local finalLabel = variants.pass1 and label .. " pass 2/2" or label
   local ok = run_encode_command(variants.final, startTime, endTime, finalLabel)
-  remove_pass_logs(variants.passlog)
+  remove_pass_logs(variants.passlog, variants.x264Stats)
   if not ok then
     return false, "final"
   end
@@ -2074,165 +2053,102 @@ cleanup_failed_encode = function(job, removeOutput, extraPaths)
   end
   cleanup_temporary_source(job)
 end
-local clamp_basket_crf
-clamp_basket_crf = function(searchProfile, value)
-  value = math.max(searchProfile.crfMin, math.min(searchProfile.crfMax, value))
-  if searchProfile.integerQuality then
-    return math.floor(value + 0.5)
+local available_encoder_names
+local function get_available_encoder_names()
+  if available_encoder_names then return available_encoder_names end
+  local encoders = mp.get_property_native("encoder-list")
+  if type(encoders) ~= "table" then return nil end
+  local names = { }
+  for _, encoder in ipairs(encoders) do
+    if encoder.driver then names[tostring(encoder.driver)] = true end
+    if encoder.codec then names[tostring(encoder.codec)] = true end
   end
-  return math.floor(value * 4 + 0.5) / 4
+  available_encoder_names = names
+  return names
 end
-local basket_has_crf
-basket_has_crf = function(candidates, value)
-  for _, candidate in ipairs(candidates) do
-    if math.abs(candidate.crf - value) < 0.0001 then
-      return true
-    end
-  end
+local function ensure_encoder_available(codec, kind)
+  if not codec or codec == "" then return true end
+  local names = get_available_encoder_names()
+  if not names or names[codec] then return true end
+  local detail = "This mpv build does not expose the " .. tostring(kind) .. " encoder '" .. tostring(codec) .. "'"
+  msg.error(detail)
+  message(detail)
   return false
 end
-local basket_candidate_or_nil
-basket_candidate_or_nil = function(searchProfile, attempts, value, current)
-  value = clamp_basket_crf(searchProfile, value)
-  if math.abs(value - current) < 0.0001 or basket_has_crf(attempts, value) then
+local function validate_encode_capabilities(ctx)
+  local videoCodec = ctx.format:getVideoCodec()
+  local audioCodec = get_native_audio_codec(ctx.format:getAudioCodec())
+  if not ensure_encoder_available(videoCodec, "video") then return false end
+  if not ensure_encoder_available(audioCodec, "audio") then return false end
+  -- Do not probe --ovcopts=help via mpv's subprocess command here: some
+  -- Windows builds return "init" before starting that probe even though
+  -- the real child encode supports the option. Let the encode report failure.
+  return true
+end
+local calculate_target_video_bitrate
+calculate_target_video_bitrate = function(format, duration, targetMB, basketVideoOnly)
+  duration = tonumber(duration)
+  targetMB = tonumber(targetMB)
+  if not duration or duration <= 0 then
+    return nil, "source duration is unavailable"
+  end
+  if not targetMB or targetMB <= 0 then
+    return nil, "target size is invalid"
+  end
+  local profile = format:getCodecProfile()
+  if not profile.targetSize then
+    return nil, "the selected encoder has no native target-bitrate mode"
+  end
+  -- Match the binary units shown as "MB" by Windows Explorer and mpv.
+  local totalBits = targetMB * 1024 * 1024 * 8
+  -- Leave a small first-pass reserve; the measured-size retry below enforces
+  -- the hard cap if the encoder or container overshoots.
+  local overheadBits = math.max(totalBits * 0.0025, 16 * 1024 * 8)
+  local audioBits = 0
+  if not basketVideoOnly and format:getAudioCodec() ~= "" then
+    audioBits = get_audio_bitrate(format:getAudioCodec()) * duration
+  end
+  local videoBits = totalBits - overheadBits - audioBits
+  if videoBits <= 0 then
+    return nil, "audio and container overhead consume the complete target budget"
+  end
+  local rawBitrate = math.floor(videoBits / duration + 0.5)
+  local bitrate = math.max(profile.bitrateMin or 1, math.min(profile.bitrateMax or rawBitrate, rawBitrate))
+  return bitrate, nil, {
+    rawBitrate = rawBitrate,
+    audioBits = audioBits,
+    overheadBits = overheadBits
+  }
+end
+local calculate_retry_video_bitrate
+calculate_retry_video_bitrate = function(currentBitrate, measuredBytes, targetBytes, profile)
+  if not measuredBytes or measuredBytes <= 0 or not targetBytes or targetBytes <= 0 then
     return nil
   end
-  return value
-end
-local get_next_basket_crf
-get_next_basket_crf = function(searchProfile, attempts, current, targetMB)
-  local over, under = { }, { }
-  for _, attempt in ipairs(attempts) do
-    if attempt.sizeMB > targetMB then
-      over[#over + 1] = attempt
-    else
-      under[#under + 1] = attempt
-    end
-  end
-
-  table.sort(over, function(a, b) return a.crf < b.crf end)
-  table.sort(under, function(a, b) return a.crf < b.crf end)
-  if #over > 0 and #under > 0 then
-    local lowCrf = over[#over]
-    local highCrf = under[1]
-    if lowCrf.crf < highCrf.crf and lowCrf.sizeMB > 0 and highCrf.sizeMB > 0 then
-      local denominator = math.log(highCrf.sizeMB) - math.log(lowCrf.sizeMB)
-      if math.abs(denominator) > 1e-12 then
-        local ratio = (math.log(targetMB) - math.log(lowCrf.sizeMB)) / denominator
-        local candidate = clamp_basket_crf(searchProfile, lowCrf.crf + (highCrf.crf - lowCrf.crf) * ratio)
-        candidate = math.max(lowCrf.crf + searchProfile.fineStep, math.min(highCrf.crf - searchProfile.fineStep, candidate))
-        candidate = basket_candidate_or_nil(searchProfile, attempts, candidate, current)
-        if candidate then
-          return candidate
-        end
-      end
-    end
-    return nil
-  end
-
-  if #attempts == 1 and attempts[1].sizeMB > 0 then
-    local only = attempts[1]
-    local candidate = only.crf + 6 * (math.log(only.sizeMB / targetMB) / math.log(2))
-    candidate = basket_candidate_or_nil(searchProfile, attempts, candidate, current)
-    if candidate then
-      return candidate
-    end
-  end
-
-  if #attempts >= 2 then
-    local sorted = copy_list(attempts)
-    table.sort(sorted, function(a, b) return a.crf < b.crf end)
-    local a = sorted[#sorted - 1]
-    local b = sorted[#sorted]
-    if a.crf ~= b.crf and a.sizeMB > 0 and b.sizeMB > 0 then
-      local slope = (math.log(b.sizeMB) - math.log(a.sizeMB)) / (b.crf - a.crf)
-      if slope < -0.005 then
-        local candidate = b.crf + (math.log(targetMB) - math.log(b.sizeMB)) / slope
-        candidate = basket_candidate_or_nil(searchProfile, attempts, candidate, current)
-        if candidate then
-          return candidate
-        end
-      end
-    end
-  end
-
-  local last = attempts[#attempts]
-  local candidate = last.sizeMB > targetMB and current + searchProfile.fineStep or current - searchProfile.fineStep
-  return basket_candidate_or_nil(searchProfile, attempts, candidate, current)
-end
-local get_initial_basket_final_crf
-get_initial_basket_final_crf = function(searchProfile, searchCrf, searchSizeMB, targetMB)
-  local offset = searchProfile.getFinalOffset and searchProfile.getFinalOffset() or 0
-  local ratio = searchSizeMB / targetMB
-  if ratio < 0.75 then
-    offset = offset - 2 * searchProfile.fineStep
-  elseif ratio < 0.88 then
-    offset = offset - searchProfile.fineStep
-  end
-  return clamp_basket_crf(searchProfile, searchCrf + offset)
-end
-local is_better_basket_candidate
-is_better_basket_candidate = function(candidate, best, targetMB)
-  if not best then
-    return true
-  end
-  local bestIsUnder = best.sizeMB <= targetMB
-  local thisIsUnder = candidate.sizeMB <= targetMB
-  if thisIsUnder and not bestIsUnder then
-    return true
-  end
-  if thisIsUnder and bestIsUnder then
-    return candidate.sizeMB > best.sizeMB
-  end
-  if not thisIsUnder and not bestIsUnder then
-    return candidate.sizeMB < best.sizeMB
-  end
-  return false
-end
-local get_basket_final_correction
-get_basket_final_correction = function(searchProfile, finalCandidates, currentCrf, sizeMB, targetMB)
-  -- Same exponential model used during search, now based on an encode at
-  -- the actual final-quality settings. Round away from the target so an
-  -- overage gets smaller and an undershoot gets larger.
-  local estimate = currentCrf + 6 * (math.log(sizeMB / targetMB) / math.log(2))
-  local corrected
-  if searchProfile.integerQuality then
-    corrected = sizeMB > targetMB and math.ceil(estimate) or math.floor(estimate)
-  else
-    corrected = sizeMB > targetMB and math.ceil(estimate * 4) / 4 or math.floor(estimate * 4) / 4
-  end
-  corrected = clamp_basket_crf(searchProfile, corrected)
-  if math.abs(corrected - currentCrf) < 0.0001 or basket_has_crf(finalCandidates, corrected) then
-    return nil
-  end
-  return corrected
+  local minimum = profile.bitrateMin or 1
+  if currentBitrate <= minimum then return nil end
+  -- Native rate control can overshoot. Scale to the measured result, then
+  -- reserve another 2% so a small fluctuation does not force a third encode.
+  local nextBitrate = math.floor(currentBitrate * targetBytes / measuredBytes * 0.98)
+  nextBitrate = math.max(minimum, nextBitrate)
+  if nextBitrate >= currentBitrate then return nil end
+  return nextBitrate
 end
 local build_basket_audio_command
 build_basket_audio_command = function(ctx, outputPath)
-  local command = {
-    "ffmpeg",
-    "-y",
-    "-ss", seconds_to_time_string(ctx.startTime, false, true),
-    "-i", ctx.path,
-    "-t", tostring(ctx.endTime - ctx.startTime)
+  local audioFormat = {
+    getVideoCodec = function() return "" end,
+    getAudioCodec = function() return "libopus" end,
+    getCodecFlags = function() return { "--vid=no" } end,
+    getMuxer = function() return "ogg" end
   }
-  append(command, get_stream_maps({
-    videoCodec = "",
-    audioCodec = "libopus"
-  }, false))
-  append(command, {
-    "-vn"
-  })
-  if options.downmix_audio then
-    append(command, {
-      "-ac", "2"
-    })
-  end
-  append(command, {
-    "-c:a", "libopus",
-    "-b:a", "96k",
-    outputPath
-  })
+  local audioCtx = {
+    format = audioFormat, path = ctx.path,
+    startTime = ctx.startTime, endTime = ctx.endTime
+  }
+  local command = build_encode_command(audioCtx)
+  append(command, get_audio_encode_flags("libopus"))
+  command[#command + 1] = "--o=" .. outputPath
   return command
 end
 -- Preserve both the old output and the successful candidate if publishing
@@ -2294,14 +2210,18 @@ end
 local encode_standard_job
 encode_standard_job = function(ctx, job)
   local format = ctx.format
+  if not validate_encode_capabilities(ctx) then
+    cleanup_failed_encode(job, false)
+    return false
+  end
   local stagedPath = staged_output_path(job.outputPath)
-  local variants = build_encode_variants(ctx, stagedPath, nil)
+  local variants = build_encode_variants(ctx, stagedPath)
   local passLabel = format:getCodecProfile().displayName or format:getVideoCodec()
   msg.info("Encoding to", job.outputPath)
   local label = variants.pass1 and passLabel or "Encoding"
   local ok, failedStage = run_encode_variants(variants, ctx.startTime, ctx.endTime, label)
   if ok and not file_is_nonempty(stagedPath) then
-    msg.error("FFmpeg exited successfully but did not create a non-empty output file")
+    msg.error("Child mpv exited successfully but did not create a non-empty output file")
     ok = false
   end
   if ok then
@@ -2332,188 +2252,85 @@ encode_standard_job = function(ctx, job)
   return false
 end
 local encode_target_size_job
-encode_target_size_job = function(ctx, job, outputDirectory, targetMB, labelPrefix)
-  -- Search with deliberately faster settings, then validate the best CRF
-  -- at the final-quality settings. Measure the actual complete candidate:
-  -- Basket is video-only, whereas MP4 and WebM AV1 include muxed audio.
-  local format = ctx.format
-  local searchProfile = format:getTargetSizeProfile()
-  if not searchProfile then
-    message("Target-size encoding is not supported by " .. tostring(format:getVideoCodec()))
+encode_target_size_job = function(ctx, job, targetMB, labelPrefix, basketVideoOnly)
+  local bitrate, bitrateError, budget = calculate_target_video_bitrate(
+    ctx.format, ctx.endTime - ctx.startTime, targetMB, basketVideoOnly)
+  if not bitrate then
+    local detail = "Target-size mode is unsupported: " .. tostring(bitrateError)
+    msg.error(detail)
+    message(detail)
     cleanup_failed_encode(job, false)
     return false
   end
-
-  local crf = searchProfile.initialCrf
-  local tolerance = searchProfile.tolerance or options.basket_target_tolerance
-  local maxAttempts = searchProfile.maxAttempts
-  local attemptExt = format:getExtension()
-  local attempts = { }
-  local bestSearch = nil
-  local bestPath = nil
-
-  local function attempt_path(stage, n)
-    return track_encode_file(utils.join_path(outputDirectory, ".encoder-target-" .. stage .. "-" .. instance_id .. "-" .. tostring(n) .. "." .. attemptExt))
-  end
-
-  local function build_and_run(targetPath, qualityProfile, progressLabel, attemptCrf, presetStage)
-    local variants = build_encode_variants(ctx, targetPath, qualityProfile, attemptCrf, presetStage)
-    if not run_encode_variants(variants, ctx.startTime, ctx.endTime, progressLabel) then
-      return false
-    end
-    local info = utils.file_info(targetPath)
-    if not info or not info.size or info.size <= 0 then
-      return false
-    end
-    return true, info.size / (1024 * 1024)
-  end
-
-  local searchFailed = false
-  for i = 1, maxAttempts do
-    local thisPath = attempt_path("search", i)
-    local label = labelPrefix .. " search " .. tostring(i) .. "/" .. tostring(maxAttempts) .. ", CRF " .. tostring(crf)
-    local ok, sizeMB = build_and_run(thisPath, "search", label, crf)
-    if not ok then
-      message("Encode failed (size-search attempt, CRF " .. tostring(crf) .. ")")
-      os.remove(thisPath)
-      searchFailed = true
-      break
-    end
-    message("Attempt " .. tostring(i) .. ": CRF " .. tostring(crf) .. " -> " .. string.format("%.1f", sizeMB) .. " MB (target " .. tostring(targetMB) .. " MB)")
-    local attempt = { crf = crf, sizeMB = sizeMB, path = thisPath }
-    attempts[#attempts + 1] = attempt
-    if is_better_basket_candidate(attempt, bestSearch, targetMB) then
-      if bestPath then
-        os.remove(bestPath)
-      end
-      bestPath = thisPath
-      bestSearch = attempt
-    else
-      os.remove(thisPath)
-    end
-    if sizeMB <= targetMB and sizeMB >= targetMB * tolerance then
-      break
-    end
-    local newCrf = get_next_basket_crf(searchProfile, attempts, crf, targetMB)
-    if not newCrf then
-      message("No useful untried CRF remains in the current search range")
-      break
-    end
-    crf = newCrf
-  end
-
-  if searchFailed then
-    local failedPaths = { }
-    for _, attempt in ipairs(attempts) do
-      failedPaths[#failedPaths + 1] = attempt.path
-    end
-    cleanup_failed_encode(job, false, failedPaths)
-    return false
-  end
-
-  if not bestSearch or not bestPath then
-    message("Encode failed")
+  ctx.targetBitrate = bitrate
+  ctx.targetBudget = budget
+  if not validate_encode_capabilities(ctx) then
     cleanup_failed_encode(job, false)
     return false
   end
-
-  message("Best search result: CRF " .. tostring(bestSearch.crf) .. " -> " .. string.format("%.1f", bestSearch.sizeMB) .. " MB")
-  local finalCrf = get_initial_basket_final_crf(searchProfile, bestSearch.crf, bestSearch.sizeMB, targetMB)
-  local finalCandidates = { }
-  local finalAttempts = math.max(1, math.floor(tonumber(searchProfile.finalAttempts or options.basket_final_attempts) or 2))
-  local finalFailed = false
-  for i = 1, finalAttempts do
-    local finalPath = attempt_path("final", i)
-    local presetStage
-    if labelPrefix == "AV1" then
-      presetStage = i == finalAttempts and "final" or "near"
+  local stagedPath = staged_output_path(job.outputPath)
+  -- Menu sizes follow Windows Explorer's binary "MB" display. Upload hosts
+  -- that enforce decimal MB can reject a file below this binary limit.
+  local targetBytes = targetMB * 1024 * 1024
+  local measuredBytes
+  local maxAttempts = 4
+  for attempt = 1, maxAttempts do
+    ctx.targetBitrate = bitrate
+    local variants = build_encode_variants(ctx, stagedPath)
+    local label = labelPrefix .. " target " .. string.format("%.0f kbps", bitrate / 1000)
+    msg.info("Native target-bitrate encode attempt " .. attempt .. "/" .. maxAttempts .. ": " .. bitrate .. " bit/s")
+    local ok, failedStage = run_encode_variants(variants, ctx.startTime, ctx.endTime, label)
+    if ok and not file_is_nonempty(stagedPath) then
+      msg.error("Child mpv exited successfully but did not create a non-empty output file")
+      ok = false
     end
-    local presetLabel = presetStage == "near" and " (preset 6)" or (presetStage == "final" and " (preset 4)" or "")
-    local label = labelPrefix .. " final " .. tostring(i) .. "/" .. tostring(finalAttempts) .. presetLabel .. ", CRF " .. tostring(finalCrf)
-    local ok, sizeMB = build_and_run(finalPath, "final", label, finalCrf, presetStage)
     if not ok then
-      message("Final encode failed (CRF " .. tostring(finalCrf) .. ")")
-      os.remove(finalPath)
-      finalFailed = true
-      break
+      cleanup_failed_encode(job, false, { stagedPath })
+      message(failedStage == "pass1" and "Encode failed (pass 1)" or "Encode failed")
+      return false
     end
-    local candidate = { crf = finalCrf, sizeMB = sizeMB, path = finalPath }
-    finalCandidates[#finalCandidates + 1] = candidate
-    message("Final " .. tostring(i) .. "/" .. tostring(finalAttempts) .. ": CRF " .. tostring(finalCrf) .. " -> " .. string.format("%.1f", sizeMB) .. " MB")
-    local withinTarget = sizeMB <= targetMB and sizeMB >= targetMB * tolerance
-    -- AV1 always gets its slower preset-4 encode, even when the preset-6
-    -- validation already falls inside the target window.
-    if withinTarget and (labelPrefix ~= "AV1" or i == finalAttempts) then
-      break
+    local info = utils.file_info(stagedPath)
+    measuredBytes = info and info.size
+    if not measuredBytes or measuredBytes <= 0 then
+      msg.error("Could not measure target-size output")
+      cleanup_failed_encode(job, false, { stagedPath })
+      message("Encode failed: output size unavailable")
+      return false
     end
-    if i < finalAttempts then
-      if not (labelPrefix == "AV1" and withinTarget) then
-        local corrected = get_basket_final_correction(searchProfile, finalCandidates, finalCrf, sizeMB, targetMB)
-        if not corrected then
-          break
-        end
-        finalCrf = corrected
-      end
+    if measuredBytes < targetBytes then break end
+    msg.warn(string.format("Target-size attempt %d produced %.6f MB (Windows units; limit %.0f MB)",
+      attempt, measuredBytes / (1024 * 1024), targetMB))
+    if attempt == maxAttempts then break end
+    local nextBitrate = calculate_retry_video_bitrate(
+      bitrate, measuredBytes, targetBytes, ctx.format:getCodecProfile())
+    if not nextBitrate then break end
+    if not os.remove(stagedPath) and file_exists(stagedPath) then
+      msg.error("Cannot remove oversized staged output before retry")
+      cleanup_failed_encode(job, false, { stagedPath })
+      message("Encode failed: oversized staged output could not be removed")
+      return false
     end
+    bitrate = nextBitrate
   end
-
-  if finalFailed then
-    local failedPaths = { bestPath }
-    for _, candidate in ipairs(finalCandidates) do
-      failedPaths[#failedPaths + 1] = candidate.path
-    end
-    cleanup_failed_encode(job, false, failedPaths)
+  if measuredBytes >= targetBytes then
+    msg.error("Target size could not be met after native bitrate retries; existing output was not replaced")
+    cleanup_failed_encode(job, false, { stagedPath })
+    message("Encode failed: target size could not be met")
     return false
   end
-
-  local selected = nil
-  for _, candidate in ipairs(finalCandidates) do
-    if candidate.sizeMB <= targetMB and (not selected or candidate.sizeMB > selected.sizeMB) then
-      selected = candidate
-    end
-  end
-  -- A faster search encode that already fits is safer than a final-quality
-  -- candidate which still overshoots the user's hard video-size limit.
-  if not selected and bestSearch.sizeMB <= targetMB then
-    selected = bestSearch
-  end
-  if not selected then
-    for _, candidate in ipairs(finalCandidates) do
-      if not selected or candidate.sizeMB < selected.sizeMB then
-        selected = candidate
-      end
-    end
-  end
-  selected = selected or bestSearch
-
-  for _, candidate in ipairs(finalCandidates) do
-    if candidate.path ~= selected.path then
-      os.remove(candidate.path)
-    end
-  end
-  if bestPath ~= selected.path then
-    os.remove(bestPath)
-  end
-  local renamed, renameError = publish_encode_result(selected.path, job.outputPath)
-  if not renamed then
-    retain_encode_file(selected.path)
+  local published, publishError = publish_encode_result(stagedPath, job.outputPath)
+  if not published then
+    retain_encode_file(stagedPath)
     retain_encode_file(job.audioOutputPath)
-    msg.error("Couldn't move target-size result into place: " .. tostring(renameError))
-    msg.error("Completed video retained at " .. selected.path)
-    if job.audioOutputPath then
-      msg.error("Completed audio retained at " .. job.audioOutputPath)
-    end
+    msg.error("Couldn't publish target-size output: " .. tostring(publishError))
+    msg.error("Completed output retained at " .. stagedPath)
     cleanup_temporary_source(job)
-    message("Couldn't publish output; completed video retained at " .. selected.path)
+    message("Couldn't publish output; completed file retained at " .. stagedPath)
     return false
   end
-  local sizeMessage = string.format("%.2f", selected.sizeMB) .. " MB, target " .. tostring(targetMB) .. " MB"
-  if selected.sizeMB > targetMB then
-    msg.warn("Target could not be met within the quality/search limits: " .. sizeMessage)
-    message("Encode finished OVER TARGET (" .. sizeMessage .. ")")
-  else
-    message("Encode finished (" .. sizeMessage .. ")")
-  end
+  local sizeMessage = string.format("%.6f", measuredBytes / (1024 * 1024)) ..
+    " MB (Windows units), under " .. tostring(targetMB) .. " MB"
+  message("Encode finished (" .. sizeMessage .. ")")
   cleanup_temporary_source(job)
   return true
 end
@@ -2533,8 +2350,6 @@ encode = function(region, startTime, endTime)
     message("No file is being played")
     return 
   end
-  local subInfo = get_subtitle_info(path)
-  local useImageOverlay = subInfo and subInfo.mode == "image" and format:getVideoCodec() ~= ""
   local dir
   if is_stream then
     dir = parse_directory("~")
@@ -2555,9 +2370,7 @@ encode = function(region, startTime, endTime)
     startTime = startTime,
     endTime = endTime,
     originalStartTime = originalStartTime,
-    region = region,
-    subInfo = subInfo,
-    useImageOverlay = useImageOverlay
+    region = region
   }
   local isBasket = options.output_format == "Basket"
   -- Snapshot playback-dependent maps/filters before the first async wait.
@@ -2575,6 +2388,10 @@ encode = function(region, startTime, endTime)
   if isBasket then
     -- Encode audio first into staging. Publish the sidecar only after video
     -- succeeds, so a failed video attempt cannot replace existing audio.
+    if not ensure_encoder_available(get_native_audio_codec("libopus"), "audio") then
+      cleanup_temporary_source(encodeJob)
+      return false
+    end
     if not encode_basket_audio(encodeContext, encodeJob.audioOutputPath) then
       cleanup_temporary_source(encodeJob)
       return
@@ -2582,11 +2399,13 @@ encode = function(region, startTime, endTime)
   end
   local ok
   if isBasket and options.target_size_basket_mb > 0 then
-    ok = encode_target_size_job(encodeContext, encodeJob, dir, options.target_size_basket_mb, "Basket")
+    ok = encode_target_size_job(encodeContext, encodeJob, options.target_size_basket_mb, "Basket", true)
   elseif options.output_format == "mp4" and options.target_size_mp4_mb > 0 and format:getTargetSizeProfile() then
-    ok = encode_target_size_job(encodeContext, encodeJob, dir, options.target_size_mp4_mb, "MP4")
+    ok = encode_target_size_job(encodeContext, encodeJob, options.target_size_mp4_mb, "MP4", false)
   elseif options.output_format == "WebM" and format:getVideoCodec() == "libsvtav1" and options.target_size_av1_mb > 0 then
-    ok = encode_target_size_job(encodeContext, encodeJob, dir, options.target_size_av1_mb, "AV1")
+    ok = encode_target_size_job(encodeContext, encodeJob, options.target_size_av1_mb, "AV1", false)
+  elseif options.output_format == "NVENC" and options.target_size_nvenc_mb > 0 then
+    ok = encode_target_size_job(encodeContext, encodeJob, options.target_size_nvenc_mb, "NVENC", false)
   else
     ok = encode_standard_job(encodeContext, encodeJob)
   end
@@ -3402,19 +3221,19 @@ do
           "crf_mp4",
           Option("int", "V-Quality", options.crf_mp4, menu_choices.crfMp4Opts, function()
 			local fmt = self:getOptionValue("output_format")
-			return fmt == "mp4" or (fmt == "Basket" and self:getOptionValue("video_codec_basket") == "libx264" and self:getOptionValue("target_size_basket_mb") == 0)
+			return (fmt == "mp4" and self:getOptionValue("target_size_mp4_mb") == 0) or (fmt == "Basket" and self:getOptionValue("video_codec_basket") == "libx264" and self:getOptionValue("target_size_basket_mb") == 0)
           end)
         },
         {
           "cq_nvenc",
           Option("int", "V-Quality", options.cq_nvenc, menu_choices.cqNvencOpts, function()
-			return self:getOptionValue("output_format") == "NVENC" and self:getOptionValue("video_codec_nvenc") ~= "av1_nvenc"
+			return self:getOptionValue("output_format") == "NVENC" and self:getOptionValue("target_size_nvenc_mb") == 0 and self:getOptionValue("video_codec_nvenc") ~= "av1_nvenc"
           end)
         },
         {
           "cq_nvenc_av1",
           Option("int", "V-Quality", options.cq_nvenc_av1, menu_choices.cqNvencAv1Opts, function()
-			return self:getOptionValue("output_format") == "NVENC" and self:getOptionValue("video_codec_nvenc") == "av1_nvenc"
+			return self:getOptionValue("output_format") == "NVENC" and self:getOptionValue("target_size_nvenc_mb") == 0 and self:getOptionValue("video_codec_nvenc") == "av1_nvenc"
           end)
         },
         {
@@ -3460,14 +3279,7 @@ do
           "fps",
           Option("list", "Framerate", options.fps, menu_choices.fpsOpts, function()
 			local fmt = self:getOptionValue("output_format")
-			return not self:getOptionValue("vfr") and (fmt == "mp4" or fmt == "WebM" or fmt == "NVENC" or fmt == "Animated" or fmt == "Basket")
-		  end)
-        },
-        {
-          "vfr",
-          Option("bool", "Variable Frame Rate", options.vfr, nil, function()
-			local fmt = self:getOptionValue("output_format")
-			return self:getOptionValue("fps") == -1 and (fmt == "mp4" or fmt == "WebM" or fmt == "NVENC" or fmt == "Animated" or fmt == "Basket")
+			return fmt == "mp4" or fmt == "WebM" or fmt == "NVENC" or fmt == "Animated" or fmt == "Basket"
 		  end)
         },
        {
@@ -3567,6 +3379,12 @@ do
           "target_size_av1_mb",
           Option("list", "Target Size", options.target_size_av1_mb, menu_choices.targetSizeOpts, function()
             return self:getOptionValue("output_format") == "WebM" and self:getOptionValue("video_codec_webm") == "libsvtav1"
+          end)
+        },
+        {
+          "target_size_nvenc_mb",
+          Option("list", "Target Size", options.target_size_nvenc_mb, menu_choices.targetSizeOpts, function()
+            return self:getOptionValue("output_format") == "NVENC"
           end)
         },
         {
@@ -3924,4 +3742,3 @@ return mp.register_event("file-loaded", (function()
     return _fn_0(_base_0, ...)
   end
 end)())
-
