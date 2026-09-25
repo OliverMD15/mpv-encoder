@@ -19,13 +19,14 @@ local options = {
 	apply_current_filters = true, -- inherit mpv's active video filters
 	downmix_audio = true,
 	mpv_executable = default_mpv_executable, -- child mpv executable; may be an absolute path
+	extended_progress_debug = false, -- show native child startup timing
 
 	-- UI
 	font_size = 20,
 	margin = 20,
 	message_duration = 3,
 
-	-- MP4 / AVC
+	-- MP4 / AVC or HEVC
 	video_codec_mp4 = "libx265", -- libx264 or libx265
 	audio_codec_muxed = "libopus", -- libopus or aac
 	crf_mp4 = 28,
@@ -34,6 +35,7 @@ local options = {
 	preset_hevc = "fast", -- fast, medium, slow, or slower
 	tune_avc = "", -- empty, film, animation, or grain
 	tune_hevc = "", -- empty, animation, or grain
+	software_hevc_10bit = false, -- libx265 Main10; off for wider player compatibility
 	color_filter_8bit = "format=yuv420p",
 
 	-- WebM / VP9 and AV1
@@ -44,7 +46,9 @@ local options = {
 	target_size_av1_mb = 0, -- 0 = Off, 20 or 200 MB; complete file including audio
 
 	-- NVENC
-	video_codec_nvenc = "av1_nvenc", -- h264_nvenc, hevc_nvenc, or av1_nvenc
+	video_codec_nvenc = "hevc_nvenc", -- h264_nvenc, hevc_nvenc, or av1_nvenc
+	nvenc_tune = "hq", -- hq or uhq (UHQ applies to HEVC/AV1 only)
+	nvenc_hevc_10bit = false, -- HEVC Main10 output; may reduce playback compatibility
 	cq_nvenc = 30,
 	cq_nvenc_av1 = 35,
 	target_size_nvenc_mb = 0, -- 0 = Off, 20 or 200 MB; complete file including audio
@@ -55,7 +59,9 @@ local options = {
 	opus_bitrate = 96000,
 	mp3_bitrate = 192000,
 
-	-- Animated WebP
+	-- Animated
+	animated_codec = "webp", -- webp or gif
+	gif_dither = "bayer", -- none, bayer, or sierra
 	quality_webp = 80, -- 0-100; higher = better quality/larger files (still lossy)
 	compression_level_webp = 4, -- 2 (fast), 4 (balanced), or 6 (very slow)
 
@@ -118,9 +124,24 @@ if #migratedLegacyOptions > 0 then
   table.sort(migratedLegacyOptions)
   msg.warn("Deprecated encoder options detected: " .. table.concat(migratedLegacyOptions, ", "))
 end
-if options.output_format == "GIF" then
-  msg.warn("Deprecated output_format=GIF detected; using Animated")
+if options.output_format == "GIF" or options.output_format == "gif" then
+  msg.warn("Deprecated output_format=" .. options.output_format .. " detected; using Animated GIF")
   options.output_format = "Animated"
+  options.animated_codec = "gif"
+end
+if options.animated_codec ~= "webp" and options.animated_codec ~= "gif" then
+  msg.warn("Unknown animated_codec '" .. tostring(options.animated_codec) .. "'; using webp")
+  options.animated_codec = "webp"
+end
+local legacyGifDither = tonumber(options.gif_dither)
+if legacyGifDither == 6 then
+  options.gif_dither = "sierra"
+elseif legacyGifDither then
+  options.gif_dither = "bayer"
+end
+if options.gif_dither ~= "none" and options.gif_dither ~= "bayer" and options.gif_dither ~= "sierra" then
+  msg.warn("Unknown gif_dither '" .. tostring(options.gif_dither) .. "'; using bayer")
+  options.gif_dither = "bayer"
 end
 if options.target_size_mp4_mb ~= 0 and options.target_size_mp4_mb ~= 20 and options.target_size_mp4_mb ~= 200 then
   msg.warn("target_size_mp4_mb must be 0, 20, or 200; using Off")
@@ -348,9 +369,8 @@ calculate_scale_factor = function()
   return osd_h / baseResY
 end
 -- Unique per running mpv instance -- lets multiple concurrent encodes
--- (different mpv processes) avoid clobbering each other's temp attempt
--- files and two-pass log files when they land in the same output
--- directory. PID is used when available (mpv 0.33+); older mpv falls
+-- (different mpv processes) avoid clobbering each other's staging
+-- directories and two-pass logs. PID is used when available (mpv 0.33+); older mpv falls
 -- back to a time+random token.
 local instance_id
 do
@@ -753,7 +773,9 @@ get_sdr_normalization_filter = function(format)
   local needs_range = levels == "full" or levels == "pc"
   local needs_matrix = matrix ~= "" and matrix ~= "unknown" and matrix ~= "bt709"
   local needs_primaries = primaries ~= "" and primaries ~= "unknown" and primaries ~= "bt709" and primaries ~= "srgb"
-  local needs_transfer = gamma ~= "" and gamma ~= "unknown" and gamma ~= "bt709"
+  -- mpv can report the BT.709 SDR transfer as BT.1886. Treat it as the
+  -- standard SDR path rather than starting libplacebo for a redundant pass.
+  local needs_transfer = gamma ~= "" and gamma ~= "unknown" and gamma ~= "bt709" and gamma ~= "bt1886"
 
   if not (needs_range or needs_matrix or needs_primaries or needs_transfer) then
     return nil
@@ -854,22 +876,19 @@ video_codec_profiles["libsvtav1"].flags = get_svt_av1_video_flags
 video_codec_profiles["libvpx-vp9"].flags = get_vp9_video_flags
 local get_nvenc_video_flags
 get_nvenc_video_flags = function(codec, ctx)
-  local tune = codec == "h264_nvenc" and "hq" or "uhq"
+  -- H.264 has no UHQ tune; invalid settings safely use HQ.
+  local tune = codec ~= "h264_nvenc" and options.nvenc_tune == "uhq" and "uhq" or "hq"
   local cq = codec == "av1_nvenc" and options.cq_nvenc_av1 or options.cq_nvenc
   local flags = {
     "--ovc=" .. codec,
     "--ovcopts-add=preset=p7",
     "--ovcopts-add=tune=" .. tune,
-    "--ovcopts-add=spatial-aq=1",
-    "--ovcopts-add=temporal-aq=1",
-    "--ovcopts-add=rc-lookahead=32",
-    "--ovcopts-add=b_ref_mode=each",
+    "--ovcopts-add=multipass=fullres",
     "--ofopts-add=movflags=+faststart"
   }
   if ctx and ctx.targetBitrate then
     local bitrate = tostring(ctx.targetBitrate)
     append(flags, {
-      "--ovcopts-add=multipass=fullres",
       "--ovcopts-add=rc=cbr",
       "--ovcopts-add=b=" .. bitrate,
       "--ovcopts-add=minrate=" .. bitrate,
@@ -881,9 +900,6 @@ get_nvenc_video_flags = function(codec, ctx)
       "--ovcopts-add=rc=vbr",
       "--ovcopts-add=cq=" .. tostring(cq)
     })
-  end
-  if codec == "av1_nvenc" then
-    flags[#flags + 1] = "--ovcopts-add=lookahead_level=3"
   end
   append(flags, get_color_tag_flags(options.color_filter_8bit))
   return flags
@@ -980,9 +996,20 @@ do
       return tostring(options.audio_codec_muxed)
     end,
     getPreFilters = function(self)
+      local filter = tostring(options.color_filter_8bit)
+      if self:getVideoCodec() == "libx265" and options.software_hevc_10bit then
+        filter = filter:gsub("format=yuv420p$", "format=yuv420p10le")
+        filter = filter:gsub("format=yuv420p,", "format=yuv420p10le,")
+      end
       return {
-        tostring(options.color_filter_8bit)
+        filter
       }
+    end,
+    getPostFilters = function(self)
+      if self:getVideoCodec() == "libx265" and options.software_hevc_10bit then
+        return { "format=yuv420p10le" }
+      end
+      return { }
     end,
     getFlags = function(self, ctx, pass)
       local flags = self:getCodecProfile().mp4Flags(ctx)
@@ -1106,12 +1133,24 @@ do
   local _parent_0 = Format
   local _base_0 = {
     getVideoCodec = function(self)
-      return "libwebp_anim"
+      return options.animated_codec == "gif" and "gif" or "libwebp_anim"
     end,
     getExtension = function(self)
-      return "webp"
+      return options.animated_codec == "gif" and "gif" or "webp"
+    end,
+    getMuxer = function(self)
+      return options.animated_codec == "gif" and "gif" or "webp"
+    end,
+    getPreFilters = function(self)
+      if options.color_filter_8bit ~= "format=yuv420p" then
+        return { tostring(options.color_filter_8bit) }
+      end
+      return { }
     end,
     getFlags = function(self)
+      if options.animated_codec == "gif" then
+        return { "--ovc=gif", "--ofopts-add=loop=0" }
+      end
       return {
         "--ovc=libwebp_anim",
         "--ofopts-add=loop=0",
@@ -1150,10 +1189,10 @@ do
     end,
     getPreFilters = function(self)
       local filter = tostring(options.color_filter_8bit)
-      -- AV1 NVENC is the only NVENC profile here which intentionally uses
-      -- a 10-bit input surface. Keep that decision with the codec that owns
-      -- it instead of leaking it into the MP4 software-encoder family.
-      if self:getVideoCodec() == "av1_nvenc" then
+      -- Select 10-bit input only for AV1 or the optional HEVC Main10 mode.
+      -- Keep the conversion before encoding, including after tone mapping.
+      local codec = self:getVideoCodec()
+      if codec == "av1_nvenc" or (codec == "hevc_nvenc" and options.nvenc_hevc_10bit) then
         filter = filter:gsub("format=yuv420p$", "format=yuv420p10le")
         filter = filter:gsub("format=yuv420p,", "format=yuv420p10le,")
       end
@@ -1366,12 +1405,27 @@ local function cancel_encode()
   if active_encode.request then active_encode.request:abort() end
 end
 local function retain_encode_file(path)
-  if path and active_encode then active_encode.files[path] = nil end
+  if path and active_encode then
+    active_encode.files[path] = nil
+    if active_encode.stagingDirectory then
+      local directory = active_encode.stagingDirectory
+      local separator = path:sub(#directory + 1, #directory + 1)
+      if path:sub(1, #directory) == directory and (separator == "/" or separator == "\\") then
+        active_encode.keepStagingDirectory = true
+      end
+    end
+  end
 end
+local remove_staging_directory
 local function finish_encode(job, status, attempt)
   local pending = false
   for path in pairs(job.files) do
     if not os.remove(path) and file_exists(path) then pending = true end
+  end
+  if job.stagingDirectory and not job.keepStagingDirectory and not pending then
+    if not remove_staging_directory(job.stagingDirectory) and file_exists(job.stagingDirectory) then
+      pending = true
+    end
   end
   -- Windows can briefly retain file handles after an aborted process exits.
   if pending and attempt < 20 then
@@ -1415,14 +1469,19 @@ mp.register_event("shutdown", function()
   cancel_encode()
   if active_encode.timer then active_encode.timer:kill() end
   for path in pairs(active_encode.files) do os.remove(path) end
+  if active_encode.stagingDirectory and not active_encode.keepStagingDirectory then
+    remove_staging_directory(active_encode.stagingDirectory)
+  end
 end)
 local EncodeWithProgress
 -- Windows uses an inherited anonymous pipe instead of a temporary progress
 -- script/file. CreateProcessW also avoids the console window from io.popen.
 local windows_progress_process
+local windows_create_staging_directory
 if is_windows then
   local available, ffi = pcall(require, "ffi")
   if available then
+    local bit = require("bit")
     ffi.cdef[[
       typedef void *HANDLE;
       typedef unsigned long DWORD;
@@ -1455,6 +1514,10 @@ if is_windows then
       int __stdcall MultiByteToWideChar(unsigned int, DWORD, const char *, int,
         wchar_t *, int);
       DWORD __stdcall GetLastError(void);
+      BOOL __stdcall CreateDirectoryW(const wchar_t *, void *);
+      BOOL __stdcall RemoveDirectoryW(const wchar_t *);
+      DWORD __stdcall GetFileAttributesW(const wchar_t *);
+      BOOL __stdcall SetFileAttributesW(const wchar_t *, DWORD);
     ]]
     local win = ffi.load("kernel32")
     local function wide(value)
@@ -1465,6 +1528,22 @@ if is_windows then
         return nil
       end
       return buffer
+    end
+    windows_create_staging_directory = function(path)
+      local name = wide(path)
+      if not name then return false, "Could not convert staging path to UTF-16" end
+      if win.CreateDirectoryW(name, nil) == 0 then
+        return false, "CreateDirectoryW failed (" .. tonumber(win.GetLastError()) .. ")"
+      end
+      local attributes = tonumber(win.GetFileAttributesW(name))
+      if attributes ~= 0xffffffff and win.SetFileAttributesW(name, bit.bor(attributes, 0x2)) == 0 then
+        msg.warn("Could not hide encoder staging directory: " .. path)
+      end
+      return true
+    end
+    remove_staging_directory = function(path)
+      local name = wide(path)
+      return name and win.RemoveDirectoryW(name) ~= 0
     end
     local function quote_arg(value)
       value = tostring(value)
@@ -1572,6 +1651,9 @@ if is_windows then
     end
   end
 end
+if not is_windows then
+  remove_staging_directory = os.remove
+end
 local function popen_progress_process(args)
   local quoted = {}
   for i, arg in ipairs(args) do
@@ -1594,12 +1676,28 @@ do
       ass:new_event()
       self:setup_text(ass)
       ass:append(tostring(self.label) .. " (" .. tostring(bold(progressText)) .. ")")
+      if options.extended_progress_debug and self.startedAt then
+        if self.firstStatusAt then
+          ass:append(string.format("\\N[debug] First child status: %.1fs | clip time: %.1fs",
+            self.firstStatusAt - self.startedAt, self.elapsed))
+        else
+          ass:append(string.format("\\N[debug] Waiting for child mpv status (%.1fs)",
+            mp.get_time() - self.startedAt))
+        end
+      end
       if is_windows and windows_progress_process then ass:append("\\NESC: Cancel") end
       return mp.set_osd_ass(window_w, window_h, ass.text)
     end,
     parseProgress = function(self, value)
       local timePos = tonumber(value:match("Encode time%-pos:%s*([%d%.]+)"))
       if timePos and timePos >= 0 then
+        if not self.firstStatusAt then
+          self.firstStatusAt = mp.get_time()
+          if options.extended_progress_debug then
+            msg.info(string.format("%s: first child mpv status after %.2fs",
+              self.label, self.firstStatusAt - self.startedAt))
+          end
+        end
         self.elapsed = math.max(self.elapsed, timePos - self.startTime)
         local percent = self.duration > 0 and
           math.floor(math.max(0, math.min(100, 100 * self.elapsed / self.duration))) or 0
@@ -1627,6 +1725,7 @@ do
       append(copy_command_line, {
         "--term-status-msg=Encode time-pos: " .. "$" .. "{=time-pos}\\n"
       })
+      self.startedAt = mp.get_time()
       self:show()
       job.page = self
       if is_windows then
@@ -1652,6 +1751,7 @@ do
         job.request = process
         job.timer = mp.add_periodic_timer(0.1, function()
           process:read_lines(on_line)
+          if options.extended_progress_debug then self:draw() end
           if not process:finished() then return end
           process:read_lines(on_line)
           if process.buffer ~= "" then on_line(process.buffer) end
@@ -1860,6 +1960,18 @@ build_video_filter_args = function(ctx)
   for _, filter in ipairs(get_video_filters(ctx.format, ctx.region)) do
     args[#args + 1] = "--vf-add=" .. filter
   end
+  if ctx.format:getVideoCodec() == "gif" then
+    local ditherFilter = {
+      none = "paletteuse=dither=none:diff_mode=rectangle",
+      bayer = "paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+      sierra = "paletteuse=dither=sierra2_4a"
+    }
+    local graph = "split[topal][vidf];[topal]palettegen[pal];" ..
+      "[vidf][pal]" .. ditherFilter[options.gif_dither]
+    -- This ordinary video filter runs after crop, scale, subtitles and tone
+    -- mapping. A complex graph would run before the ordinary filter chain.
+    args[#args + 1] = "--vf-add=lavfi=graph=[" .. graph .. "]"
+  end
   return args
 end
 local function append_property(out, propertyName, optionName)
@@ -1893,18 +2005,29 @@ get_sub_options = function()
 end
 local build_encode_command
 build_encode_command = function(ctx)
+  local isGif = ctx.format:getVideoCodec() == "gif"
+  local source = ctx.path
+  if isGif then
+    -- palettegen emits its palette only at EOF. mpv's --end is an output
+    -- stop and may let the filter scan the rest of a long source first.
+    -- EDL gives the selected range a real EOF without a temporary file.
+    source = "edl://%" .. tostring(#ctx.path) .. "%" .. ctx.path .. "," ..
+      tostring(ctx.startTime) .. "," .. tostring(ctx.endTime - ctx.startTime)
+  end
   local command = {
     tostring(options.mpv_executable),
-    ctx.path,
+    source,
     "--no-config",
-    "--start=" .. seconds_to_time_string(ctx.startTime, false, true),
-    "--end=" .. seconds_to_time_string(ctx.endTime, false, true),
     "--loop-file=no",
     "--no-pause",
     "--no-keep-open",
     "--input-default-bindings=no",
     "--osc=no"
   }
+  if not isGif then
+    command[#command + 1] = "--start=" .. seconds_to_time_string(ctx.startTime, false, true)
+    command[#command + 1] = "--end=" .. seconds_to_time_string(ctx.endTime, false, true)
+  end
   append(command, get_track_flags(ctx.format))
   append(command, ctx.format:getCodecFlags())
   local muxer = ctx.format:getMuxer()
@@ -1919,6 +2042,17 @@ build_encode_command = function(ctx)
   end
   append(command, get_playback_options())
   append(command, get_sub_options())
+  if isGif then
+    for _, track in ipairs(get_active_tracks().sub) do
+      if track.external then
+        -- EDL resets the clip clock to zero; external subtitle files keep
+        -- their original timestamps unless their delay is shifted too.
+        local delay = tonumber(mp.get_property_native("sub-delay")) or 0
+        command[#command + 1] = "--sub-delay=" .. tostring(delay - ctx.startTime)
+        break
+      end
+    end
+  end
   append(command, build_video_filter_args(ctx))
   return command
 end
@@ -2186,8 +2320,34 @@ local function publish_encode_result(candidatePath, outputPath)
   return true
 end
 local encode_basket_audio
+local function create_staging_directory(outputDir)
+  for index = 1, 100 do
+    local path = utils.join_path(outputDir, ".encoder-temp-" .. instance_id .. "-" .. index)
+    if not file_exists(path) then
+      local created, reason
+      if is_windows then
+        if windows_create_staging_directory then
+          created, reason = windows_create_staging_directory(path)
+        else
+          reason = "LuaJIT FFI is unavailable"
+        end
+      else
+        local result = mp.command_native({ name = "subprocess", args = { "mkdir", path },
+          capture_stdout = false, capture_stderr = true })
+        created = result and result.status == 0
+        reason = result and result.stderr or "mkdir failed"
+      end
+      if created then return path end
+      if not file_exists(path) then return nil, reason end
+    end
+  end
+  return nil, "could not find a free staging directory name"
+end
 local function staged_output_path(outputPath)
   local dir, filename = utils.split_path(outputPath)
+  if active_encode and active_encode.stagingDirectory then
+    dir = active_encode.stagingDirectory
+  end
   local index = 0
   local path
   repeat
@@ -2219,7 +2379,9 @@ encode_standard_job = function(ctx, job)
   local passLabel = format:getCodecProfile().displayName or format:getVideoCodec()
   msg.info("Encoding to", job.outputPath)
   local label = variants.pass1 and passLabel or "Encoding"
-  local ok, failedStage = run_encode_variants(variants, ctx.startTime, ctx.endTime, label)
+  local progressStart = format:getVideoCodec() == "gif" and 0 or ctx.startTime
+  local progressEnd = format:getVideoCodec() == "gif" and (ctx.endTime - ctx.startTime) or ctx.endTime
+  local ok, failedStage = run_encode_variants(variants, progressStart, progressEnd, label)
   if ok and not file_is_nonempty(stagedPath) then
     msg.error("Child mpv exited successfully but did not create a non-empty output file")
     ok = false
@@ -2363,6 +2525,12 @@ encode = function(region, startTime, endTime)
   local formatted_filename = format_filename(originalStartTime, originalEndTime, format)
   local out_path = utils.join_path(dir, formatted_filename)
   active_encode.directory = dir
+  local stagingDirectory, stagingError = create_staging_directory(dir)
+  if stagingDirectory then
+    active_encode.stagingDirectory = stagingDirectory
+  else
+    msg.warn("Could not create encoder staging directory; using output directory: " .. tostring(stagingError))
+  end
   if is_temporary then track_encode_file(path) end
   local encodeContext = {
     format = format,
@@ -3123,6 +3291,19 @@ local menu_choices = {
           { 6, "Maximum (Very Slow)" }
         }
   },
+  animatedCodecOpts = {
+    possibleValues = {
+      { "webp", "WebP" },
+      { "gif", "GIF" }
+    }
+  },
+  gifDitherOpts = {
+    possibleValues = {
+      { "none", "None" },
+      { "bayer", "Bayer" },
+      { "sierra", "Sierra" }
+    }
+  },
 }
 menu_choices.formatOpts = { possibleValues = {} }
 for _, id in ipairs({ "mp4", "WebM", "NVENC", "Audio", "Animated", "Basket" }) do
@@ -3301,6 +3482,12 @@ do
           end)
         },
         {
+          "animated_codec",
+          Option("list", "V-Codec", options.animated_codec, menu_choices.animatedCodecOpts, function()
+            return self:getOptionValue("output_format") == "Animated"
+          end)
+        },
+        {
           "audio_codec_muxed",
           Option("list", "A-Codec", options.audio_codec_muxed, menu_choices.audioCodecMuxedOpts, function()
 			local fmt = self:getOptionValue("output_format")
@@ -3354,13 +3541,19 @@ do
           "color_filter_8bit",
           Option("list", "Tone mapping", options.color_filter_8bit, menu_choices.colorFilter8BitOpts, function()
 			local fmt = self:getOptionValue("output_format")
-			return fmt == "mp4" or fmt == "NVENC" or (fmt == "Basket" and self:getOptionValue("video_codec_basket") == "libx264")
+			return fmt == "mp4" or fmt == "NVENC" or fmt == "Animated" or (fmt == "Basket" and self:getOptionValue("video_codec_basket") == "libx264")
+          end)
+        },
+        {
+          "gif_dither",
+          Option("list", "Dithering", options.gif_dither, menu_choices.gifDitherOpts, function()
+            return self:getOptionValue("output_format") == "Animated" and self:getOptionValue("animated_codec") == "gif"
           end)
         },
         {
           "compression_level_webp",
           Option("list", "Compression", options.compression_level_webp, menu_choices.compressionLevelWebpOpts, function()
-			return self:getOptionValue("output_format") == "Animated"
+			return self:getOptionValue("output_format") == "Animated" and self:getOptionValue("animated_codec") == "webp"
           end)
         },
         {
